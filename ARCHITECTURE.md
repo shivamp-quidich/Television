@@ -36,7 +36,7 @@ flowchart TB
         fd["shared_ptr&lt;FrameData&gt; with GPU uyvy_frame"]
         meta["Assign id, timestamp, sync_timestamp_ms"]
         info["IIngest::getVideoInfo -> VideoInputState::Config"]
-        gate["Stability gate: mode dimensions match for 2+ frames"]
+        gate["Stability gate: same dimensions for 2+ consecutive frames"]
         get --> alloc --> h2d --> fd --> meta
         meta --> info
         meta --> gate
@@ -90,6 +90,12 @@ Two details are easy to get wrong when modifying the preview:
 - The preview device-to-device copy narrows each row from `pitch` to
   `width × 2`, so the UYVY texture never contains DeckLink row padding, while
   the output path forwards the original padded pitch unchanged.
+- `IngestVideoInfo::signal_detected` must not be used to decide whether the
+  frame in hand is valid. `DeckLinkCapture::getFrameBuffer` clears the
+  frame-available flag when it hands a frame over, so `getVideoInfo` reports
+  `signal_detected == false` immediately after a successful `getFrame`. Gating
+  output initialization on it makes startup depend on a race with the capture
+  callback, which delays SDI output by an arbitrary amount of time.
 
 ## Frame contract
 

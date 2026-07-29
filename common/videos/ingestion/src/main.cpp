@@ -560,6 +560,15 @@ int main(int argc, char* argv[])
 #include <cuda_runtime.h>
 
 namespace {
+// Reports a failure when it first appears and stays silent until it clears, so a
+// persistent per-frame failure cannot flood the log.
+void reportFailure(bool& latched, bool failed, const char* message)
+{
+    if (failed && !latched)
+        getModuleLogger("app")->warn(message);
+    latched = failed;
+}
+
 bool copyFrameToHost(const FrameData& frame, std::vector<uint8_t>& host)
 {
     const auto& uyvy = *frame.uyvy_frame;
@@ -621,6 +630,10 @@ int main(int argc, char* argv[])
     int stable_width = 0;
     int stable_height = 0;
     int stable_frame_count = 0;
+    std::vector<uint8_t> output_staging;
+    bool preview_failing = false;
+    bool staging_failing = false;
+    bool output_send_failing = false;
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -638,7 +651,10 @@ int main(int argc, char* argv[])
             video_config.width = info.width;
             video_config.height = info.height;
             video_config.display_mode_name = info.display_mode_name;
-            video_config.signal_detected = info.signal_detected;
+            // getFrame() consumes the capture's frame-available flag, so
+            // info.signal_detected is false for the frame we are holding.
+            // Holding a decoded frame is itself proof of an input signal.
+            video_config.signal_detected = true;
             video_config.interlaced = info.interlaced;
             video_config.ideal_fps = info.ideal_fps;
             video_config.fps_threshold = info.fps_threshold;
@@ -654,15 +670,21 @@ int main(int argc, char* argv[])
             } else {
                 stable_frame_count = 0;
             }
-            if (!output_ready && info.signal_detected && stable_frame_count >= 2)
+            if (!output_ready && stable_frame_count >= 2)
                 output_ready = ingest->initializeOutput(output_device);
             if (output_ready && dimensions_match_mode && preview_updated) {
-                std::vector<uint8_t> output_staging;
-                if (copyFrameToHost(*frame, output_staging))
-                    ingest->sendFrameToOutput(output_staging.data(), output_staging.size(),
-                                               frame->uyvy_frame->width, frame->uyvy_frame->height,
-                                               frame->uyvy_frame->pitch);
+                const bool staged = copyFrameToHost(*frame, output_staging);
+                reportFailure(staging_failing, !staged, "Device-to-host staging copy failed");
+                if (staged) {
+                    const bool sent = ingest->sendFrameToOutput(
+                        output_staging.data(), output_staging.size(),
+                        frame->uyvy_frame->width, frame->uyvy_frame->height,
+                        frame->uyvy_frame->pitch);
+                    reportFailure(output_send_failing, !sent, "DeckLink output rejected a frame");
+                }
             }
+            reportFailure(preview_failing, !preview_updated,
+                          "GPU preview update failed; SDI output is gated on it");
             status = info.display_mode_name + "  GPU FrameData #" + std::to_string(frame->id) +
                      (preview_updated ? "" : "  (preview update failed)");
         } else {
