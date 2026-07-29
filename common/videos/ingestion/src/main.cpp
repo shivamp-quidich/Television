@@ -1,0 +1,713 @@
+#if 0 // Replaced by the GLFW/OpenGL/ImGui operator application below.
+#if 0
+#include "decklink_capture.hpp"
+#include "logger.h"
+
+#include <climits>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#include <opencv2/opencv.hpp>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+int parseDeviceIndex(const char* argument, const char* name)
+{
+    char* end = nullptr;
+    const long value = std::strtol(argument, &end, 10);
+    if (*argument == '\0' || *end != '\0' || value < 0 || value > INT_MAX)
+    {
+        throw std::runtime_error(std::string("Invalid ") + name + " device index: " + argument);
+    }
+
+    return static_cast<int>(value);
+}
+
+} // namespace
+
+int main(int argc, char* argv[])
+{
+    if (argc > 3)
+    {
+        std::cerr << "Usage: decklink_passthrough [input-device=0] [output-device=1]\n";
+        return EXIT_FAILURE;
+    }
+
+    int inputDevice = 0;
+    int outputDevice = 1;
+    try
+    {
+        if (argc >= 2)
+        {
+            inputDevice = parseDeviceIndex(argv[1], "input");
+        }
+        if (argc == 3)
+        {
+            outputDevice = parseDeviceIndex(argv[2], "output");
+        }
+    }
+    catch (const std::exception& error)
+    {
+        std::cerr << error.what() << '\n';
+        return EXIT_FAILURE;
+    }
+
+    initLogger();
+    DeckLinkCapture capture;
+    if (!capture.initialize(inputDevice) || !capture.startCapture())
+    {
+        std::cerr << "Unable to start capture on DeckLink input " << inputDevice << '\n';
+        return EXIT_FAILURE;
+    }
+
+    cv::namedWindow("DeckLink input", cv::WINDOW_NORMAL);
+    std::cout << "Capturing from device " << inputDevice << ", previewing, and sending to device "
+              << outputDevice << ". Press q or Esc to stop.\n";
+
+    bool outputReady = false;
+    int outputWidth = 0;
+    int outputHeight = 0;
+    int observedWidth = 0;
+    int observedHeight = 0;
+    int stableFrameCount = 0;
+    auto lastStatus = std::chrono::steady_clock::now();
+    uint64_t frameCount = 0;
+
+    while (true)
+    {
+        std::vector<uint8_t> frameBytes;
+        int width = 0;
+        int height = 0;
+        if (!capture.getFrameBuffer(frameBytes, width, height))
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+
+        const int pitch = capture.getLastFramePitch();
+        const size_t expectedSize = static_cast<size_t>(pitch) * static_cast<size_t>(height);
+        if (width <= 0 || height <= 0 || pitch <= 0 || frameBytes.size() < expectedSize)
+        {
+            std::cerr << "Ignoring invalid capture frame (" << width << 'x' << height
+                      << ", pitch=" << pitch << ", bytes=" << frameBytes.size() << ")\n";
+            continue;
+        }
+
+        cv::Mat uyvy(height, width, CV_8UC2, frameBytes.data(), pitch);
+        cv::Mat bgr;
+        cv::cvtColor(uyvy, bgr, cv::COLOR_YUV2BGR_UYVY);
+        cv::imshow("DeckLink input", bgr);
+
+        int modeWidth = 0;
+        int modeHeight = 0;
+        capture.getCurrentDisplayModeResolution(modeWidth, modeHeight);
+        if (modeWidth == 0 || modeHeight == 0 || width != modeWidth || height != modeHeight)
+        {
+            // Preview pre-detection and stale buffered frames, but never forward
+            // them into output configured for a different DeckLink display mode.
+            observedWidth = 0;
+            observedHeight = 0;
+            stableFrameCount = 0;
+            const int key = cv::waitKey(1) & 0xFF;
+            if (key == 'q' || key == 27)
+            {
+                break;
+            }
+            continue;
+        }
+
+        // The SDK can deliver one frame from the previous mode before its format
+        // change callback restarts capture. Require two same-size frames before
+        // configuring output, so a stale frame cannot select the wrong SDI mode.
+        if (width == observedWidth && height == observedHeight)
+        {
+            ++stableFrameCount;
+        }
+        else
+        {
+            observedWidth = width;
+            observedHeight = height;
+            stableFrameCount = 1;
+        }
+
+        // Reinitialize output only after the replacement signal is stable, so raw
+        // UYVY is never sent to a mismatched DeckLink display mode.
+        if (!outputReady || width != outputWidth || height != outputHeight)
+        {
+            if (stableFrameCount < 2)
+            {
+                const int key = cv::waitKey(1) & 0xFF;
+                if (key == 'q' || key == 27)
+                {
+                    break;
+                }
+                continue;
+            }
+
+            if (!capture.initializeOutput(outputDevice))
+            {
+                std::cerr << "Unable to initialize DeckLink output " << outputDevice << '\n';
+                break;
+            }
+            outputReady = true;
+            outputWidth = width;
+            outputHeight = height;
+            std::cout << "Output initialized for " << width << 'x' << height
+                      << " (" << capture.getOutputDisplayModeName() << ")\n";
+        }
+
+        if (!capture.sendFrameToDecklink(frameBytes.data(), expectedSize, width, height, pitch))
+        {
+            std::cerr << "Failed to send frame to DeckLink output\n";
+        }
+
+        ++frameCount;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastStatus >= std::chrono::seconds(5))
+        {
+            std::cout << "Forwarded " << frameCount << " frames; input mode "
+                      << capture.getDisplayModeName() << '\n';
+            lastStatus = now;
+        }
+
+        const int key = cv::waitKey(1) & 0xFF;
+        if (key == 'q' || key == 27)
+        {
+            break;
+        }
+    }
+
+    capture.disableOutput(0);
+    capture.stopCapture();
+    cv::destroyAllWindows();
+    return 0;
+}
+#endif
+
+#include "decklink_capture.hpp"
+#include "logger.h"
+#include "stype_csv_overlay.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <climits>
+#include <cfloat>
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <GL/glew.h>
+#include <GLFW/glfw3.h>
+#include <imgui.h>
+#include <backends/imgui_impl_glfw.h>
+#include <backends/imgui_impl_opengl3.h>
+#include <opencv2/imgproc.hpp>
+
+namespace {
+
+int parseDeviceIndex(const char* argument, const char* name)
+{
+    char* end = nullptr;
+    const long value = std::strtol(argument, &end, 10);
+    if (*argument == '\0' || *end != '\0' || value < 0 || value > INT_MAX)
+        throw std::runtime_error(std::string("Invalid ") + name + " device index: " + argument);
+    return static_cast<int>(value);
+}
+
+std::vector<std::filesystem::path> csvFiles(const std::filesystem::path& directory)
+{
+    std::vector<std::filesystem::path> files;
+    if (!std::filesystem::is_directory(directory))
+        return files;
+    for (const auto& entry : std::filesystem::directory_iterator(directory))
+        if (entry.is_regular_file() && entry.path().extension() == ".csv")
+            files.push_back(entry.path());
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+void uploadFrame(GLuint texture, const cv::Mat& bgr)
+{
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, bgr.cols, bgr.rows, 0,
+                 GL_BGR, GL_UNSIGNED_BYTE, bgr.data);
+}
+
+} // namespace
+
+int main(int argc, char* argv[])
+{
+    if (argc > 3)
+    {
+        std::cerr << "Usage: decklink_passthrough [input-device=0] [output-device=1]\n";
+        return EXIT_FAILURE;
+    }
+
+    int inputDevice = 0;
+    int outputDevice = 1;
+    try
+    {
+        if (argc >= 2) inputDevice = parseDeviceIndex(argv[1], "input");
+        if (argc == 3) outputDevice = parseDeviceIndex(argv[2], "output");
+    }
+    catch (const std::exception& error)
+    {
+        std::cerr << error.what() << '\n';
+        return EXIT_FAILURE;
+    }
+
+    if (!glfwInit())
+    {
+        std::cerr << "Unable to initialize GLFW\n";
+        return EXIT_FAILURE;
+    }
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    GLFWwindow* window = glfwCreateWindow(1600, 900, "Televison", nullptr, nullptr);
+    if (!window)
+    {
+        glfwTerminate();
+        return EXIT_FAILURE;
+    }
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1);
+    glewExperimental = GL_TRUE;
+    if (glewInit() != GLEW_OK)
+    {
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return EXIT_FAILURE;
+    }
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 330");
+
+    GLuint previewTexture = 0;
+    glGenTextures(1, &previewTexture);
+    glBindTexture(GL_TEXTURE_2D, previewTexture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    initLogger();
+    DeckLinkCapture capture;
+    if (!capture.initialize(inputDevice) || !capture.startCapture())
+    {
+        std::cerr << "Unable to start DeckLink input " << inputDevice << '\n';
+        glDeleteTextures(1, &previewTexture);
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return EXIT_FAILURE;
+    }
+
+    const std::filesystem::path csvDirectory = "csv";
+    std::vector<std::filesystem::path> files = csvFiles(csvDirectory);
+    stype::Records records;
+    int selectedFile = -1;
+    int csvOffset = 0;
+    std::string csvStatus = "Select a CSV from csv/";
+    if (!files.empty())
+    {
+        selectedFile = 0;
+        stype::loadCsv(files.front().string(), records, &csvStatus);
+        if (!records.empty())
+            csvStatus = "Loaded " + std::to_string(records.size()) + " tracking rows";
+    }
+
+    bool outputReady = false;
+    int outputWidth = 0, outputHeight = 0;
+    int stableWidth = 0, stableHeight = 0, stableFrames = 0;
+    std::uint64_t videoFrame = 0;
+    cv::Mat preview;
+    stype::Record activeRecord;
+    bool hasActiveRecord = false;
+    std::string outputStatus = "Waiting for input format";
+
+    while (!glfwWindowShouldClose(window))
+    {
+        glfwPollEvents();
+        std::vector<std::uint8_t> frameBytes;
+        int width = 0, height = 0;
+        if (capture.getFrameBuffer(frameBytes, width, height))
+        {
+            const int pitch = capture.getLastFramePitch();
+            const size_t frameSize = static_cast<size_t>(pitch) * static_cast<size_t>(height);
+            int modeWidth = 0, modeHeight = 0;
+            capture.getCurrentDisplayModeResolution(modeWidth, modeHeight);
+            if (width > 0 && height > 0 && pitch > 0 && frameBytes.size() >= frameSize)
+            {
+                cv::Mat uyvy(height, width, CV_8UC2, frameBytes.data(), pitch);
+                cv::cvtColor(uyvy, preview, cv::COLOR_YUV2BGR_UYVY);
+                hasActiveRecord = false;
+                const auto row = static_cast<std::int64_t>(videoFrame) + csvOffset;
+                if (row >= 0 && row < static_cast<std::int64_t>(records.size()))
+                {
+                    activeRecord = records[static_cast<size_t>(row)];
+                    hasActiveRecord = true;
+                    stype::drawOverlay(preview, activeRecord);
+                }
+
+                uploadFrame(previewTexture, preview);
+                ++videoFrame;
+
+                const bool modeMatches = modeWidth == width && modeHeight == height;
+                if (modeMatches)
+                {
+                    stableFrames = (width == stableWidth && height == stableHeight) ? stableFrames + 1 : 1;
+                    stableWidth = width;
+                    stableHeight = height;
+                }
+                else
+                {
+                    stableFrames = 0;
+                }
+
+                if (modeMatches && stableFrames >= 2 &&
+                    (!outputReady || width != outputWidth || height != outputHeight))
+                {
+                    outputReady = capture.initializeOutput(outputDevice);
+                    if (outputReady)
+                    {
+                        outputWidth = width;
+                        outputHeight = height;
+                        outputStatus = "Output " + std::to_string(capture.getActiveOutputDeviceIndex()) + ": " +
+                                       capture.getOutputDisplayModeName();
+                    }
+                    else
+                    {
+                        outputStatus = "DeckLink output initialization failed";
+                    }
+                }
+
+                if (outputReady && modeMatches && width == outputWidth && height == outputHeight)
+                {
+                    cv::Mat outputUyvy(height, width, CV_8UC2);
+                    cv::cvtColor(preview, outputUyvy, cv::COLOR_BGR2YUV_UYVY);
+                    if (!capture.sendFrameToDecklink(outputUyvy.data,
+                                                     outputUyvy.total() * outputUyvy.elemSize(),
+                                                     width, height,
+                                                     static_cast<int>(outputUyvy.step)))
+                        outputStatus = "DeckLink output frame send failed";
+                }
+            }
+        }
+        else
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        constexpr float panelWidth = 390.0f;
+        ImGui::SetNextWindowPos(viewport->WorkPos);
+        ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x - panelWidth, viewport->WorkSize.y));
+        ImGui::Begin("Live DeckLink Video", nullptr,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+        if (!preview.empty())
+        {
+            const ImVec2 available = ImGui::GetContentRegionAvail();
+            const float scale = std::min(available.x / preview.cols, available.y / preview.rows);
+            ImGui::Image(reinterpret_cast<void*>(static_cast<intptr_t>(previewTexture)),
+                         ImVec2(preview.cols * scale, preview.rows * scale));
+        }
+        else
+        {
+            ImGui::TextUnformatted("Waiting for DeckLink video input...");
+        }
+        ImGui::End();
+
+        ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - panelWidth, viewport->WorkPos.y));
+        ImGui::SetNextWindowSize(ImVec2(panelWidth, viewport->WorkSize.y));
+        ImGui::Begin("Tracking Control", nullptr,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+        ImGui::Text("Input %d  Output %d", inputDevice, outputDevice);
+        ImGui::TextWrapped("%s", outputStatus.c_str());
+        ImGui::Separator();
+        ImGui::TextUnformatted("Tracking CSV");
+        if (ImGui::Button("Refresh CSV list"))
+        {
+            files = csvFiles(csvDirectory);
+            if (selectedFile >= static_cast<int>(files.size())) selectedFile = -1;
+        }
+        if (ImGui::BeginCombo("CSV file", selectedFile >= 0 ? files[selectedFile].filename().c_str() : "(none)"))
+        {
+            for (int i = 0; i < static_cast<int>(files.size()); ++i)
+            {
+                const bool selected = i == selectedFile;
+                if (ImGui::Selectable(files[i].filename().c_str(), selected))
+                {
+                    stype::Records loaded;
+                    std::string error;
+                    if (stype::loadCsv(files[i].string(), loaded, &error))
+                    {
+                        records = std::move(loaded);
+                        selectedFile = i;
+                        videoFrame = 0;
+                        csvStatus = "Loaded " + std::to_string(records.size()) + " rows";
+                    }
+                    else
+                    {
+                        csvStatus = error;
+                    }
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reload") && selectedFile >= 0)
+        {
+            stype::Records loaded;
+            if (stype::loadCsv(files[selectedFile].string(), loaded, &csvStatus))
+                records = std::move(loaded);
+        }
+        ImGui::TextWrapped("%s", csvStatus.c_str());
+        ImGui::SliderInt("CSV frame offset", &csvOffset, -500, 500);
+        ImGui::Text("Video frame: %llu", static_cast<unsigned long long>(videoFrame));
+
+        if (hasActiveRecord)
+        {
+            ImGui::Separator();
+            ImGui::Text("CSV row %lld", static_cast<long long>(activeRecord.frame_id));
+            ImGui::Text("Pan %.2f  Tilt %.2f  Roll %.2f", activeRecord.pan_deg, activeRecord.tilt_deg, activeRecord.roll_deg);
+            ImGui::Text("X %.3f  Y %.3f  Z %.3f m", activeRecord.x_mm / 1000.0,
+                        activeRecord.y_mm / 1000.0, activeRecord.z_mm / 1000.0);
+            ImGui::Text("HFOV %.2f  Zoom %lld  Focus %lld", activeRecord.hfov_deg,
+                        static_cast<long long>(activeRecord.zoom_raw), static_cast<long long>(activeRecord.focus_raw));
+        }
+        if (!records.empty())
+        {
+            std::vector<float> pan, tilt, roll, x, y, z;
+            pan.reserve(records.size()); tilt.reserve(records.size()); roll.reserve(records.size());
+            x.reserve(records.size()); y.reserve(records.size()); z.reserve(records.size());
+            for (const auto& record : records)
+            {
+                pan.push_back(static_cast<float>(record.pan_deg)); tilt.push_back(static_cast<float>(record.tilt_deg));
+                roll.push_back(static_cast<float>(record.roll_deg)); x.push_back(static_cast<float>(record.x_mm / 1000.0));
+                y.push_back(static_cast<float>(record.y_mm / 1000.0)); z.push_back(static_cast<float>(record.z_mm / 1000.0));
+            }
+            const int marker = std::clamp(static_cast<int>(videoFrame) + csvOffset, 0, static_cast<int>(records.size()) - 1);
+            ImGui::Separator();
+            ImGui::TextUnformatted("CSV values");
+            ImGui::PlotLines("Pan", pan.data(), static_cast<int>(pan.size()), marker, nullptr, -180.0f, 180.0f, ImVec2(-1, 70));
+            ImGui::PlotLines("Tilt", tilt.data(), static_cast<int>(tilt.size()), marker, nullptr, -180.0f, 180.0f, ImVec2(-1, 70));
+            ImGui::PlotLines("Roll", roll.data(), static_cast<int>(roll.size()), marker, nullptr, -180.0f, 180.0f, ImVec2(-1, 70));
+            ImGui::PlotLines("X (m)", x.data(), static_cast<int>(x.size()), marker, nullptr, FLT_MAX, FLT_MAX, ImVec2(-1, 55));
+            ImGui::PlotLines("Y (m)", y.data(), static_cast<int>(y.size()), marker, nullptr, FLT_MAX, FLT_MAX, ImVec2(-1, 55));
+            ImGui::PlotLines("Z (m)", z.data(), static_cast<int>(z.size()), marker, nullptr, FLT_MAX, FLT_MAX, ImVec2(-1, 55));
+        }
+        ImGui::End();
+
+        ImGui::Render();
+        int displayWidth = 0, displayHeight = 0;
+        glfwGetFramebufferSize(window, &displayWidth, &displayHeight);
+        glViewport(0, 0, displayWidth, displayHeight);
+        glClearColor(0.06f, 0.07f, 0.12f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(window);
+    }
+
+    capture.disableOutput(0);
+    capture.stopCapture();
+    glDeleteTextures(1, &previewTexture);
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return EXIT_SUCCESS;
+}
+#endif
+
+#include "gpu_uyvy_preview.hpp"
+#include "ingest.hpp"
+#include "logger.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <GL/glew.h>
+#include <GLFW/glfw3.h>
+#include <imgui.h>
+#include <backends/imgui_impl_glfw.h>
+#include <backends/imgui_impl_opengl3.h>
+#include <cuda_runtime.h>
+
+namespace {
+bool copyFrameToHost(const FrameData& frame, std::vector<uint8_t>& host)
+{
+    const auto& uyvy = *frame.uyvy_frame;
+    host.resize(uyvy.size);
+    return cudaMemcpy2D(host.data(), uyvy.pitch, uyvy.d_data, uyvy.pitch,
+                        uyvy.pitch, uyvy.height, cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+} // namespace
+
+int main(int argc, char* argv[])
+{
+    const int input_device = argc > 1 ? std::atoi(argv[1]) : 0;
+    const int output_device = argc > 2 ? std::atoi(argv[2]) : 1;
+    if (!glfwInit())
+        return EXIT_FAILURE;
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    GLFWwindow* window = glfwCreateWindow(1600, 900, "Televison", nullptr, nullptr);
+    if (!window) {
+        glfwTerminate();
+        return EXIT_FAILURE;
+    }
+    glfwMakeContextCurrent(window);
+    glewExperimental = GL_TRUE;
+    if (glewInit() != GLEW_OK) {
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return EXIT_FAILURE;
+    }
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 330");
+
+    initLogger();
+    SharedState shared_state;
+    IngestConfig config;
+    config.input_device = input_device;
+    config.output_device = output_device;
+    auto ingest = CreateIngest(config);
+    if (!ingest || !ingest->initialize(config) || !ingest->startCapture()) {
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return EXIT_FAILURE;
+    }
+    ingest->setSharedState(&shared_state);
+
+    GpuUyvyPreview preview;
+
+    std::uint64_t frame_id = 0;
+    std::string status = "Waiting for DeckLink input";
+    bool output_ready = false;
+    int stable_width = 0;
+    int stable_height = 0;
+    int stable_frame_count = 0;
+
+    while (!glfwWindowShouldClose(window)) {
+        glfwPollEvents();
+        std::shared_ptr<FrameData> frame;
+        if (ingest->getFrame(frame) && frame && frame->uyvy_frame) {
+            frame->id = static_cast<int>(frame_id++);
+            frame->timestamp = std::chrono::steady_clock::now();
+            frame->sync_timestamp_ms = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+            const bool preview_updated = preview.update(*frame->uyvy_frame);
+
+            const IngestVideoInfo info = ingest->getVideoInfo();
+            VideoInputState::Config video_config;
+            video_config.width = info.width;
+            video_config.height = info.height;
+            video_config.display_mode_name = info.display_mode_name;
+            video_config.signal_detected = info.signal_detected;
+            video_config.interlaced = info.interlaced;
+            video_config.ideal_fps = info.ideal_fps;
+            video_config.fps_threshold = info.fps_threshold;
+            shared_state.setData(video_config);
+
+            const bool dimensions_match_mode = info.width == frame->uyvy_frame->width &&
+                                               info.height == frame->uyvy_frame->height;
+            if (dimensions_match_mode) {
+                stable_frame_count = (stable_width == info.width && stable_height == info.height)
+                    ? stable_frame_count + 1 : 1;
+                stable_width = info.width;
+                stable_height = info.height;
+            } else {
+                stable_frame_count = 0;
+            }
+            if (!output_ready && info.signal_detected && stable_frame_count >= 2)
+                output_ready = ingest->initializeOutput(output_device);
+            if (output_ready && dimensions_match_mode && preview_updated) {
+                std::vector<uint8_t> output_staging;
+                if (copyFrameToHost(*frame, output_staging))
+                    ingest->sendFrameToOutput(output_staging.data(), output_staging.size(),
+                                               frame->uyvy_frame->width, frame->uyvy_frame->height,
+                                               frame->uyvy_frame->pitch);
+            }
+            status = info.display_mode_name + "  GPU FrameData #" + std::to_string(frame->id) +
+                     (preview_updated ? "" : "  (preview update failed)");
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        constexpr float controls_width = 390.0f;
+        ImGui::SetNextWindowPos(viewport->WorkPos);
+        ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x - controls_width, viewport->WorkSize.y));
+        ImGui::Begin("GPU DeckLink Preview", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+        if (preview.rgbTexture()) {
+            const ImVec2 available = ImGui::GetContentRegionAvail();
+            const float scale = std::min(available.x / preview.width(), available.y / preview.height());
+            ImGui::Image(reinterpret_cast<void*>(static_cast<intptr_t>(preview.rgbTexture())),
+                         ImVec2(preview.width() * scale, preview.height() * scale));
+        } else {
+            ImGui::TextUnformatted("Waiting for GPU FrameData...");
+        }
+        ImGui::End();
+
+        ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - controls_width, viewport->WorkPos.y));
+        ImGui::SetNextWindowSize(ImVec2(controls_width, viewport->WorkSize.y));
+        ImGui::Begin("Application Status", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+        ImGui::TextWrapped("%s", status.c_str());
+        ImGui::TextUnformatted("CSV tracking and frame overlays are disabled.");
+        ImGui::End();
+
+        ImGui::Render();
+        int display_width = 0, display_height = 0;
+        glfwGetFramebufferSize(window, &display_width, &display_height);
+        glViewport(0, 0, display_width, display_height);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(window);
+    }
+    ingest->disableOutput(0);
+    ingest->stopCapture();
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return EXIT_SUCCESS;
+}

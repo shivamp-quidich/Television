@@ -1,0 +1,12 @@
+prefix=/usr
+libdir=${prefix}/lib/x86_64-linux-gnu
+includedir=${prefix}/include/imgui
+
+Name: imgui
+Description: Bloat-free Immediate Mode Graphical User interface for C++
+Version: 1.90.1
+Requires: stb
+URL: https://github.com/ocornut/imgui
+Libs: -L${libdir} -limgui
+Libs.private: -lm
+Cflags: -I${includedir}

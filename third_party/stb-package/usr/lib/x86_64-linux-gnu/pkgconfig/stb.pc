@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=${prefix}/lib/x86_64-linux-gnu
+includedir=${prefix}/include/stb
+
+Name: stb
+Description: single-file image and audio processing libraries for C/C++
+Version: 0.0
+Libs: -L${libdir} -lstb
+Cflags: -I${includedir}

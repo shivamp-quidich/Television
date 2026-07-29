@@ -1,0 +1,28 @@
+build/
+
+# CMake-generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Makefile
+.cursor
+
+# Local media and data files
+*.csv
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.mxf
+*.ts
+*.m2ts
+imgui.ini
+libimgui-dev_1.90.1+ds-1_amd64.deb
+libstb-dev_0.0~git20230129.5736b15+ds-1.2_amd64.deb
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*.swo
+*~
