@@ -17,6 +17,7 @@ Makefile
 *.mxf
 *.ts
 *.m2ts
+udpOut/
 imgui.ini
 libimgui-dev_1.90.1+ds-1_amd64.deb
 libstb-dev_0.0~git20230129.5736b15+ds-1.2_amd64.deb

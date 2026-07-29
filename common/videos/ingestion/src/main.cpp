@@ -540,17 +540,23 @@ int main(int argc, char* argv[])
 }
 #endif
 
+#include "camera_trajectory_overlay.hpp"
 #include "gpu_uyvy_preview.hpp"
 #include "ingest.hpp"
 #include "logger.h"
+#include "udp_receiver.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
+#include <deque>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <opencv2/imgproc.hpp>
 
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
@@ -575,6 +581,26 @@ bool copyFrameToHost(const FrameData& frame, std::vector<uint8_t>& host)
     host.resize(uyvy.size);
     return cudaMemcpy2D(host.data(), uyvy.pitch, uyvy.d_data, uyvy.pitch,
                         uyvy.pitch, uyvy.height, cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+
+// Paints the tracking visualization into the staged UYVY bytes so the DeckLink
+// output carries the same picture the operator sees in the preview.
+bool burnOverlayIntoStagedFrame(std::vector<uint8_t>& host, int width, int height, int pitch,
+                                const std::deque<STypeState::CameraData>& trail,
+                                const STypeState::CameraData& camera,
+                                const CameraTrajectoryOverlayOptions& options,
+                                cv::Mat& bgr_scratch)
+{
+    if (width <= 0 || height <= 0 || pitch < width * 2)
+        return false;
+    if (host.size() < static_cast<std::size_t>(pitch) * static_cast<std::size_t>(height))
+        return false;
+
+    cv::Mat uyvy(height, width, CV_8UC2, host.data(), static_cast<std::size_t>(pitch));
+    cv::cvtColor(uyvy, bgr_scratch, cv::COLOR_YUV2BGR_UYVY);
+    drawCameraTrajectoryOnBgr(bgr_scratch, trail, camera, options);
+    cv::cvtColor(bgr_scratch, uyvy, cv::COLOR_BGR2YUV_UYVY);
+    return true;
 }
 } // namespace
 
@@ -623,6 +649,11 @@ int main(int argc, char* argv[])
     ingest->setSharedState(&shared_state);
 
     GpuUyvyPreview preview;
+    UdpReceiver udp_receiver;
+    constexpr const char* kUdpBindIp = "127.0.0.1";
+    constexpr const char* kUdpRawOutput = "/home/quidich/Televison/udpOut/udp_raw.txt";
+    int udp_port = 6305;
+    udp_receiver.start(kUdpBindIp, udp_port, kUdpRawOutput);
 
     std::uint64_t frame_id = 0;
     std::string status = "Waiting for DeckLink input";
@@ -635,8 +666,27 @@ int main(int argc, char* argv[])
     bool staging_failing = false;
     bool output_send_failing = false;
 
+    CameraTrajectoryOverlayOptions trajectory_options;
+    bool burn_overlay_into_output = true;
+    std::deque<STypeState::CameraData> camera_trail;
+    std::uint64_t trail_packet_count = 0;
+    cv::Mat overlay_scratch;
+    bool overlay_burn_failing = false;
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+
+        // Sampled once per iteration so the SDI burn-in and the preview overlay
+        // always visualize the same pose.
+        const UdpReceiver::Status udp = udp_receiver.status();
+        if (udp.last_packet_valid && udp.packets_received != trail_packet_count) {
+            trail_packet_count = udp.packets_received;
+            camera_trail.push_back(udp.last_camera);
+            while (camera_trail.size() > static_cast<std::size_t>(std::max(2, trajectory_options.max_trail_points)))
+                camera_trail.pop_front();
+        }
+        const bool overlay_available = trajectory_options.enabled && udp.last_packet_valid;
+
         std::shared_ptr<FrameData> frame;
         if (ingest->getFrame(frame) && frame && frame->uyvy_frame) {
             frame->id = static_cast<int>(frame_id++);
@@ -676,6 +726,15 @@ int main(int argc, char* argv[])
                 const bool staged = copyFrameToHost(*frame, output_staging);
                 reportFailure(staging_failing, !staged, "Device-to-host staging copy failed");
                 if (staged) {
+                    bool burn_failed = false;
+                    if (burn_overlay_into_output && overlay_available) {
+                        burn_failed = !burnOverlayIntoStagedFrame(
+                            output_staging, frame->uyvy_frame->width, frame->uyvy_frame->height,
+                            frame->uyvy_frame->pitch, camera_trail, udp.last_camera,
+                            trajectory_options, overlay_scratch);
+                    }
+                    reportFailure(overlay_burn_failing, burn_failed,
+                                  "Trajectory burn-in skipped; sending the clean frame");
                     const bool sent = ingest->sendFrameToOutput(
                         output_staging.data(), output_staging.size(),
                         frame->uyvy_frame->width, frame->uyvy_frame->height,
@@ -704,6 +763,22 @@ int main(int argc, char* argv[])
             const float scale = std::min(available.x / preview.width(), available.y / preview.height());
             ImGui::Image(reinterpret_cast<void*>(static_cast<intptr_t>(preview.rgbTexture())),
                          ImVec2(preview.width() * scale, preview.height() * scale));
+            const ImVec2 image_min = ImGui::GetItemRectMin();
+            const ImVec2 image_max = ImGui::GetItemRectMax();
+            // Clicking the picture re-places the scene. Storing the position
+            // normalized keeps the preview and the SDI frame in agreement.
+            if (trajectory_options.enabled && ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                const ImVec2 mouse = ImGui::GetIO().MousePos;
+                trajectory_options.anchor_u =
+                    std::clamp((mouse.x - image_min.x) / std::max(image_max.x - image_min.x, 1.0f), 0.0f, 1.0f);
+                trajectory_options.anchor_v =
+                    std::clamp((mouse.y - image_min.y) / std::max(image_max.y - image_min.y, 1.0f), 0.0f, 1.0f);
+            }
+            // The preview draws the overlay with ImGui rather than reading back
+            // the burned frame, so it mirrors what SDI carries at zero extra cost.
+            if (overlay_available)
+                drawCameraTrajectoryOverlay(ImGui::GetWindowDrawList(), image_min, image_max,
+                                            camera_trail, udp.last_camera, trajectory_options);
         } else {
             ImGui::TextUnformatted("Waiting for GPU FrameData...");
         }
@@ -714,6 +789,66 @@ int main(int argc, char* argv[])
         ImGui::Begin("Application Status", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
         ImGui::TextWrapped("%s", status.c_str());
         ImGui::TextUnformatted("CSV tracking and frame overlays are disabled.");
+        ImGui::Separator();
+        ImGui::TextUnformatted("UDP receive");
+        ImGui::Text("Bind IP  %s  (local)", kUdpBindIp);
+        ImGui::InputInt("Port", &udp_port);
+        if (udp_port < 1) udp_port = 1;
+        if (udp_port > 65535) udp_port = 65535;
+        if (ImGui::Button("Apply UDP port"))
+            udp_receiver.start(kUdpBindIp, udp_port, kUdpRawOutput);
+
+        ImGui::Text("Listening  %s", udp.listening ? "yes" : "no");
+        ImGui::Text("Packets  %llu", static_cast<unsigned long long>(udp.packets_received));
+        ImGui::Text("Last size  %d bytes", udp.last_packet_size);
+        ImGui::TextWrapped("UDP text file  %s", udp.raw_output_path.c_str());
+        if (!udp.last_error.empty())
+            ImGui::TextWrapped("Error: %s", udp.last_error.c_str());
+        if (udp.last_packet_valid) {
+            const auto& cam = udp.last_camera;
+            // Pose telemetry is reported here rather than drawn on the picture,
+            // matching viz3d's read-out bar. Y is the height axis, Z is depth.
+            ImGui::Text("Cam %d   zoom %d   focus %d", cam.camera_id, cam.zoom_raw, cam.focus_raw);
+            ImGui::Text("pan %8.2f   tilt %7.2f   roll %6.2f deg",
+                        cam.pan_deg, cam.tilt_deg, cam.roll_deg);
+            ImGui::Text("X %7.1f   Y %6.1f   Z(depth) %7.1f m",
+                        cam.x_mm * 0.001f, cam.y_mm * 0.001f, cam.z_mm * 0.001f);
+            ImGui::Text("dist-to-origin %.1f m",
+                        std::sqrt(cam.x_mm * cam.x_mm + cam.z_mm * cam.z_mm) * 0.001f);
+        } else if (udp.packets_received > 0) {
+            ImGui::TextUnformatted("Last packet was not a valid FreeD D1 frame.");
+        }
+
+        ImGui::Separator();
+        ImGui::TextUnformatted("Trajectory overlay");
+        ImGui::Checkbox("Show overlay", &trajectory_options.enabled);
+        ImGui::Checkbox("Burn into SDI output", &burn_overlay_into_output);
+        ImGui::Checkbox("Ground grid", &trajectory_options.show_grid);
+        ImGui::DragFloat("Ground plane", &trajectory_options.ground_plane_y_mm,
+                         10.0f, -100000.0f, 100000.0f, "%.0f mm");
+        ImGui::Checkbox("Frustum web", &trajectory_options.show_frustum);
+        ImGui::BeginDisabled(!trajectory_options.show_frustum);
+        ImGui::SliderFloat("Cone angle", &trajectory_options.frustum_half_angle_deg,
+                           1.0f, 60.0f, "%.1f deg half");
+        ImGui::SliderFloat("Web length", &trajectory_options.frustum_length_percent,
+                           1.0f, 100.0f, "%.0f%% of trail");
+        if (ImGui::Button("Reset frustum")) {
+            const CameraTrajectoryOverlayOptions defaults;
+            trajectory_options.frustum_half_angle_deg = defaults.frustum_half_angle_deg;
+            trajectory_options.frustum_length_percent = defaults.frustum_length_percent;
+        }
+        ImGui::EndDisabled();
+        ImGui::SliderInt("Trail length", &trajectory_options.max_trail_points, 2, 2000);
+        ImGui::Text("Trail samples  %d", static_cast<int>(camera_trail.size()));
+        if (ImGui::Button("Clear trail"))
+            camera_trail.clear();
+        ImGui::TextWrapped("Click the video to place the scene. Anchor %.2f, %.2f",
+                           trajectory_options.anchor_u, trajectory_options.anchor_v);
+        if (ImGui::Button("Centre scene")) {
+            const CameraTrajectoryOverlayOptions defaults;
+            trajectory_options.anchor_u = defaults.anchor_u;
+            trajectory_options.anchor_v = defaults.anchor_v;
+        }
         ImGui::End();
 
         ImGui::Render();
@@ -726,6 +861,7 @@ int main(int argc, char* argv[])
     }
     ingest->disableOutput(0);
     ingest->stopCapture();
+    udp_receiver.stop();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

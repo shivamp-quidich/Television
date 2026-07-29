@@ -115,6 +115,8 @@ if (BUILD_DECKLINK_PASSTHROUGH)
     add_executable(decklink_passthrough
         src/main.cpp
         src/gpu_uyvy_preview.cpp
+        src/udp_receiver.cpp
+        src/camera_trajectory_overlay.cpp
     )
     target_link_libraries(decklink_passthrough PRIVATE
         ingestion
