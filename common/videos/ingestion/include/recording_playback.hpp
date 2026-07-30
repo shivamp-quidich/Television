@@ -45,6 +45,9 @@ public:
     bool playing = false;
     int csv_offset = 0;
     bool show_world_origin = true;
+    // When true, world-origin gizmo uses the latest UDP pose instead of the
+    // CSV row for this video frame (same projection as CSV overlay).
+    bool overlay_from_udp = false;
     stype::OverlayOptions overlay_options;
 
     // Advances one video frame when playing and enough wall time has elapsed.
@@ -54,8 +57,11 @@ public:
     // Seek to an absolute video frame index (clamped).
     bool seek(int frame_index);
 
-    // Re-apply CSV overlay after offset / gizmo options change (same frame).
+    // Re-apply overlay after offset / gizmo / pose-source options change.
     void refreshOverlay();
+
+    // Store delayed UDP pose and redraw gizmo when overlay_from_udp is on.
+    void setUdpOverlayRecord(const stype::Record& record);
 
     // BGR frame ready for GL upload / ImGui (includes overlay when enabled).
     const cv::Mat& display() const { return display_; }
@@ -76,5 +82,7 @@ private:
     cv::Mat display_;
     stype::Record active_record_;
     bool has_record_ = false;
+    stype::Record udp_overlay_record_;
+    bool has_udp_overlay_record_ = false;
     std::int64_t last_advance_ms_ = 0;
 };

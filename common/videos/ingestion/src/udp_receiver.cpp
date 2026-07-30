@@ -9,16 +9,19 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cmath>
+
 #include "logger.h"
 
 namespace {
-constexpr std::uint8_t kFreeDType = 0xD1;
-constexpr int kFreeDLen = 29;
-// The Stype simulator prefixes the FreeD payload with a sync header:
+constexpr std::uint8_t kStypeHfType = 0x0F;
+constexpr int kStypeHfLen = 67;
+// Optional sync header from the internal sender / Stype simulator:
 // "STQ1" + uint32 frame id + uint64 timestamp, all little-endian.
 constexpr char kSyncMagic[4] = {'S', 'T', 'Q', '1'};
 constexpr int kSyncHeaderLen = 16;
-constexpr int kSyncPacketLen = kSyncHeaderLen + kFreeDLen;
+constexpr int kSyncPacketLen = kSyncHeaderLen + kStypeHfLen;
 constexpr int kRecvTimeoutMs = 200;
 constexpr int kMaxDatagram = 2048;
 
@@ -28,20 +31,19 @@ std::shared_ptr<spdlog::logger> log()
     return logger;
 }
 
-std::int32_t decodeInt24(const std::uint8_t* buf, int off)
+float readLeFloat(const std::uint8_t* bytes)
 {
-    const std::uint32_t v = (static_cast<std::uint32_t>(buf[off]) << 16)
-                          | (static_cast<std::uint32_t>(buf[off + 1]) << 8)
-                          | static_cast<std::uint32_t>(buf[off + 2]);
-    return (v & 0x800000u) ? static_cast<std::int32_t>(v | 0xFF000000u)
-                           : static_cast<std::int32_t>(v);
+    float value = 0.0f;
+    std::memcpy(&value, bytes, sizeof(value));
+    return value;
 }
 
-std::uint32_t decodeUint24(const std::uint8_t* buf, int off)
+int normalizedToRaw(float normalized)
 {
-    return (static_cast<std::uint32_t>(buf[off]) << 16)
-         | (static_cast<std::uint32_t>(buf[off + 1]) << 8)
-         | static_cast<std::uint32_t>(buf[off + 2]);
+    if (!std::isfinite(normalized))
+        return 0;
+    const float clamped = std::clamp(normalized, 0.0f, 1.0f);
+    return static_cast<int>(std::lround(clamped * 65535.0f));
 }
 } // namespace
 
@@ -119,27 +121,42 @@ bool UdpReceiver::openRawOutput_(const std::string& path, std::string& error)
     return true;
 }
 
-bool UdpReceiver::parseFreeD(const std::uint8_t* buf, int len, STypeState::CameraData& out)
+bool UdpReceiver::parseStypeHf(const std::uint8_t* buf, int len, STypeState::CameraData& out)
 {
-    // Accept both the simulator's sync-wrapped datagram and the bare 29-byte
-    // payload a real FreeD source sends.
+    // Accept STQ1-wrapped datagrams from the internal sender, and bare 67-byte
+    // Stype HF payloads from a real tracking source.
     if (len >= kSyncPacketLen && std::memcmp(buf, kSyncMagic, sizeof(kSyncMagic)) == 0) {
         buf += kSyncHeaderLen;
-        len = kFreeDLen;
+        len = kStypeHfLen;
     }
-    if (len < kFreeDLen || buf[0] != kFreeDType)
+    if (len < kStypeHfLen || buf[0] != kStypeHfType)
+        return false;
+
+    std::uint8_t checksum = 0;
+    for (int i = 0; i < kStypeHfLen - 1; ++i)
+        checksum = static_cast<std::uint8_t>(checksum + buf[i]);
+    if (checksum != buf[kStypeHfLen - 1])
         return false;
 
     out = {};
-    out.camera_id = buf[1];
-    out.pan_deg = static_cast<float>(decodeInt24(buf, 2)) / 32768.0f;
-    out.tilt_deg = static_cast<float>(decodeInt24(buf, 5)) / 32768.0f;
-    out.roll_deg = static_cast<float>(decodeInt24(buf, 8)) / 32768.0f;
-    out.x_mm = static_cast<float>(decodeInt24(buf, 11)) / 64.0f;
-    out.z_mm = static_cast<float>(decodeInt24(buf, 14)) / 64.0f;
-    out.y_mm = static_cast<float>(decodeInt24(buf, 17)) / 64.0f;
-    out.zoom_raw = static_cast<int>(decodeUint24(buf, 20));
-    out.focus_raw = static_cast<int>(decodeUint24(buf, 23));
+    out.camera_id = buf[1] & 0x0F;
+    out.packet_no = buf[5];
+    // Packet stores metres; CameraData keeps millimetres.
+    out.x_mm = readLeFloat(buf + 6) * 1000.0f;
+    out.y_mm = readLeFloat(buf + 10) * 1000.0f;
+    out.z_mm = readLeFloat(buf + 14) * 1000.0f;
+    out.pan_deg = readLeFloat(buf + 18);
+    out.tilt_deg = readLeFloat(buf + 22);
+    out.roll_deg = readLeFloat(buf + 26);
+    out.hfov_deg = readLeFloat(buf + 30);
+    out.hf_ar = readLeFloat(buf + 34);
+    out.focus_raw = normalizedToRaw(readLeFloat(buf + 38));
+    out.zoom_raw = normalizedToRaw(readLeFloat(buf + 42));
+    out.hf_k1 = readLeFloat(buf + 46);
+    out.hf_k2 = readLeFloat(buf + 50);
+    out.hf_cx_mm = readLeFloat(buf + 54);
+    out.hf_cy_mm = readLeFloat(buf + 58);
+    out.hf_pa_width_mm = readLeFloat(buf + 62);
     out.is_valid = true;
     out.last_update = std::chrono::steady_clock::now();
     return true;
@@ -194,7 +211,7 @@ bool UdpReceiver::start(const std::string& bind_ip, int port, const std::string&
 
     running_ = true;
     thread_ = std::thread(&UdpReceiver::receiverLoop_, this);
-    log()->info("UDP receiver listening on {}:{}; raw packets -> {}",
+    log()->info("UDP receiver listening on {}:{} (Stype HF); raw packets -> {}",
                 bind_ip, port, raw_output_path);
     return true;
 }
@@ -234,12 +251,13 @@ void UdpReceiver::receiverLoop_()
         }
 
         STypeState::CameraData camera;
-        const bool valid = parseFreeD(buffer, static_cast<int>(received), camera);
+        const bool valid = parseStypeHf(buffer, static_cast<int>(received), camera);
 
         if (valid) {
             raw_output_
                 << std::fixed << std::setprecision(6)
                 << "camera_id=" << camera.camera_id
+                << " packet_no=" << camera.packet_no
                 << " pan_deg=" << camera.pan_deg
                 << " tilt_deg=" << camera.tilt_deg
                 << " roll_deg=" << camera.roll_deg
@@ -248,6 +266,13 @@ void UdpReceiver::receiverLoop_()
                 << " z_mm=" << camera.z_mm
                 << " zoom_raw=" << camera.zoom_raw
                 << " focus_raw=" << camera.focus_raw
+                << " hfov_deg=" << camera.hfov_deg
+                << " hf_ar=" << camera.hf_ar
+                << " hf_k1=" << camera.hf_k1
+                << " hf_k2=" << camera.hf_k2
+                << " hf_cx_mm=" << camera.hf_cx_mm
+                << " hf_cy_mm=" << camera.hf_cy_mm
+                << " hf_pa_width_mm=" << camera.hf_pa_width_mm
                 << '\n';
         } else {
             raw_output_ << "invalid_packet size=" << received << " bytes=";

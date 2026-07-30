@@ -954,7 +954,7 @@ int main(int argc, char* argv[])
             if (advanced)
                 recording_display_dirty = true;
 
-            // Internal UDP send only while recording is playing (CSV pose -> FreeD).
+            // Internal UDP send only while recording is playing (CSV pose -> Stype HF).
             if (recording_udp_send_enabled && recording.playing && recording.hasRecord() && advanced) {
                 const auto aligned = stype::applyAlignment(
                     recording.activeRecord(), recording.overlay_options.alignment);
@@ -1150,11 +1150,13 @@ int main(int argc, char* argv[])
         if (ImGui::RadioButton("Live DeckLink", &source_i, 0)) {
             source_mode = SourceMode::Live;
             recording.playing = false;
+            recording_udp_send_enabled = false;
             status = "Live DeckLink";
         }
         ImGui::SameLine();
         if (ImGui::RadioButton("Recording", &source_i, 1)) {
             source_mode = SourceMode::Recording;
+            recording_udp_send_enabled = true;
             status = "Recording playback";
         }
         source_mode = static_cast<SourceMode>(source_i);
@@ -1214,7 +1216,8 @@ int main(int argc, char* argv[])
 
         if (recording.isOpen()) {
             ImGui::Checkbox("SDI out", &recording_sdi_enabled);
-            ImGui::Checkbox("UDP send CSV while playing", &recording_udp_send_enabled);
+            if (source_mode == SourceMode::Recording)
+                ImGui::Checkbox("UDP send CSV while playing", &recording_udp_send_enabled);
             if (ImGui::Button(recording.playing ? "Pause" : "Play"))
                 recording.playing = !recording.playing;
             ImGui::SameLine();
@@ -1295,22 +1298,26 @@ int main(int argc, char* argv[])
         ImGui::InputInt("Recv port", &udp_port);
         if (udp_port < 1) udp_port = 1;
         if (udp_port > 65535) udp_port = 65535;
-        char send_ip_buf[64];
-        std::snprintf(send_ip_buf, sizeof(send_ip_buf), "%s", udp_send_ip.c_str());
-        if (ImGui::InputText("Send IP", send_ip_buf, sizeof(send_ip_buf)))
-            udp_send_ip = send_ip_buf;
-        ImGui::InputInt("Send port", &udp_send_port);
-        if (udp_send_port < 1) udp_send_port = 1;
-        if (udp_send_port > 65535) udp_send_port = 65535;
+        if (source_mode == SourceMode::Recording) {
+            char send_ip_buf[64];
+            std::snprintf(send_ip_buf, sizeof(send_ip_buf), "%s", udp_send_ip.c_str());
+            if (ImGui::InputText("Send IP", send_ip_buf, sizeof(send_ip_buf)))
+                udp_send_ip = send_ip_buf;
+            ImGui::InputInt("Send port", &udp_send_port);
+            if (udp_send_port < 1) udp_send_port = 1;
+            if (udp_send_port > 65535) udp_send_port = 65535;
+        }
         if (ImGui::SliderInt("Recv delay (ms)", &udp_recv_delay_ms, 0, 2000)) {
             // Keep buffered packets; only the release threshold changes.
         }
         ImGui::TextDisabled("Hold each UDP packet this many ms before use/plots");
         if (ImGui::Button("Apply UDP")) {
             udp_receiver.start(udp_bind_ip, udp_port, udp_raw_output);
-            std::string send_error;
-            if (!udp_sender.configure(udp_send_ip, udp_send_port, send_error))
-                getModuleLogger("app")->warn("UDP sender: {}", send_error);
+            if (source_mode == SourceMode::Recording) {
+                std::string send_error;
+                if (!udp_sender.configure(udp_send_ip, udp_send_port, send_error))
+                    getModuleLogger("app")->warn("UDP sender: {}", send_error);
+            }
             last_udp_packets_seen = 0;
             udp_plot_history.clear();
             udp_recv_delay_buf.clear();
@@ -1320,9 +1327,11 @@ int main(int argc, char* argv[])
         const auto send_status = udp_sender.status();
         ImGui::Text("Listening  %s", udp.listening ? "yes" : "no");
         ImGui::Text("Recv packets  %llu", static_cast<unsigned long long>(udp.packets_received));
-        ImGui::Text("Send packets  %llu  %s",
-                    static_cast<unsigned long long>(send_status.packets_sent),
-                    (recording.playing && recording_udp_send_enabled) ? "(active)" : "(idle)");
+        if (source_mode == SourceMode::Recording) {
+            ImGui::Text("Send packets  %llu  %s",
+                        static_cast<unsigned long long>(send_status.packets_sent),
+                        (recording.playing && recording_udp_send_enabled) ? "(active)" : "(idle)");
+        }
         ImGui::Text("Delay buffer  %d  (%d ms)",
                     static_cast<int>(udp_recv_delay_buf.size()),
                     std::max(0, udp_recv_delay_ms));
@@ -1330,23 +1339,32 @@ int main(int argc, char* argv[])
         ImGui::TextWrapped("UDP text file  %s", udp.raw_output_path.c_str());
         if (!udp.last_error.empty())
             ImGui::TextWrapped("Recv error: %s", udp.last_error.c_str());
-        if (!send_status.last_error.empty())
+        if (source_mode == SourceMode::Recording && !send_status.last_error.empty())
             ImGui::TextWrapped("Send error: %s", send_status.last_error.c_str());
         if (udp_delayed_valid) {
             const auto& cam = udp_delayed_camera;
-            ImGui::TextUnformatted("Delayed pose (synced)");
-            ImGui::Text("Cam %d   zoom %d   focus %d", cam.camera_id, cam.zoom_raw, cam.focus_raw);
+            ImGui::TextUnformatted("Delayed Stype HF pose (synced)");
+            ImGui::Text("Cam %d   pkt %d   zoom %d   focus %d",
+                        cam.camera_id, cam.packet_no, cam.zoom_raw, cam.focus_raw);
             ImGui::Text("pan %8.2f   tilt %7.2f   roll %6.2f deg",
                         cam.pan_deg, cam.tilt_deg, cam.roll_deg);
             ImGui::Text("X %7.1f   Y %6.1f   Z(depth) %7.1f m",
                         cam.x_mm * 0.001f, cam.y_mm * 0.001f, cam.z_mm * 0.001f);
             ImGui::Text("dist-to-origin %.1f m",
                         std::sqrt(cam.x_mm * cam.x_mm + cam.z_mm * cam.z_mm) * 0.001f);
+            ImGui::Text("HFOV %.2f deg   AR %.3f   PA width %.2f mm",
+                        cam.hfov_deg, cam.hf_ar, cam.hf_pa_width_mm);
+            ImGui::Text("k1 %.6f   k2 %.6f", cam.hf_k1, cam.hf_k2);
+            ImGui::Text("cx %.3f mm   cy %.3f mm", cam.hf_cx_mm, cam.hf_cy_mm);
+            if (STypeState::hasValidHfFov(cam))
+                ImGui::TextUnformatted("HF optics  valid");
+            else
+                ImGui::TextUnformatted("HF optics  incomplete");
         } else if (udp.last_packet_valid) {
             ImGui::TextWrapped("Waiting for recv delay (%d ms)...",
                                std::max(0, udp_recv_delay_ms));
         } else if (udp.packets_received > 0) {
-            ImGui::TextUnformatted("Last packet was not a valid FreeD D1 frame.");
+            ImGui::TextUnformatted("Last packet was not a valid Stype HF (0x0F) frame.");
         }
 
         if (!udp_plot_history.empty()) {

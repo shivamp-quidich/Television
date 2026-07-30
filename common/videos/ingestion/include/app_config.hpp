@@ -15,7 +15,7 @@ struct AppConfig {
     int udp_port = 6305;
     std::string udp_send_ip = "127.0.0.1";
     int udp_send_port = 6305;
-    // Hold received FreeD poses this many milliseconds before UI/plots/use, so
+    // Hold received Stype HF poses this many milliseconds before UI/plots/use, so
     // the tracking stream can be lagged to match video.
     int udp_recv_delay_ms = 0;
     std::string udp_raw_output_path = "udpOut/udp_raw.txt";

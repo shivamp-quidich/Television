@@ -9,7 +9,7 @@
 
 #include "shared_state.h"
 
-// Background UDP listener for Stype FreeD D1 tracking packets.
+// Background UDP listener for Stype HF (0x0F, 67-byte) tracking packets.
 // Binds a local address (default 127.0.0.1) and port (default 6305).
 class UdpReceiver {
 public:
@@ -33,7 +33,7 @@ public:
     UdpReceiver& operator=(const UdpReceiver&) = delete;
 
     // Starts a new receiver session. raw_output_path is truncated before the
-    // first packet, then each FreeD datagram is written as readable pose text.
+    // first packet, then each Stype HF datagram is written as readable pose text.
     bool start(const std::string& bind_ip, int port, const std::string& raw_output_path);
 
     void stop();
@@ -46,7 +46,7 @@ private:
     bool openRawOutput_(const std::string& path, std::string& error);
     void closeSocket_();
 
-    static bool parseFreeD(const std::uint8_t* buf, int len, STypeState::CameraData& out);
+    static bool parseStypeHf(const std::uint8_t* buf, int len, STypeState::CameraData& out);
 
     mutable std::mutex mutex_;
     std::thread thread_;

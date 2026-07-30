@@ -14,11 +14,15 @@
 
 namespace {
 
-constexpr std::uint8_t kFreeDType = 0xD1;
-constexpr int kFreeDLen = 29;
+constexpr std::uint8_t kStypeHfType = 0x0F;
+constexpr int kStypeHfLen = 67;
 constexpr char kSyncMagic[4] = {'S', 'T', 'Q', '1'};
 constexpr int kSyncHeaderLen = 16;
-constexpr int kPacketLen = kSyncHeaderLen + kFreeDLen;
+constexpr int kPacketLen = kSyncHeaderLen + kStypeHfLen;
+
+constexpr float kDefaultHfovDeg = 40.0f;
+constexpr float kDefaultAspect = 16.0f / 9.0f;
+constexpr float kDefaultPaWidthMm = 9.6f;
 
 std::shared_ptr<spdlog::logger> log()
 {
@@ -26,37 +30,36 @@ std::shared_ptr<spdlog::logger> log()
     return logger;
 }
 
-void encodeInt24(std::uint8_t* buf, int off, std::int32_t value)
+void writeLeFloat(std::uint8_t* packet, int offset, float value)
 {
-    const auto v = static_cast<std::uint32_t>(value) & 0xFFFFFFu;
-    buf[off] = static_cast<std::uint8_t>((v >> 16) & 0xFF);
-    buf[off + 1] = static_cast<std::uint8_t>((v >> 8) & 0xFF);
-    buf[off + 2] = static_cast<std::uint8_t>(v & 0xFF);
+    static_assert(sizeof(float) == sizeof(std::uint32_t), "Stype HF needs IEEE-754 floats");
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    packet[offset] = static_cast<std::uint8_t>(bits & 0xFFu);
+    packet[offset + 1] = static_cast<std::uint8_t>((bits >> 8) & 0xFFu);
+    packet[offset + 2] = static_cast<std::uint8_t>((bits >> 16) & 0xFFu);
+    packet[offset + 3] = static_cast<std::uint8_t>((bits >> 24) & 0xFFu);
 }
 
-void encodeUint24(std::uint8_t* buf, int off, std::uint32_t value)
+float resolveHfov(double hfov_deg)
 {
-    encodeInt24(buf, off, static_cast<std::int32_t>(value & 0xFFFFFFu));
+    return (std::isfinite(hfov_deg) && hfov_deg > 0.5 && hfov_deg < 180.0)
+        ? static_cast<float>(hfov_deg)
+        : kDefaultHfovDeg;
 }
 
-std::int32_t angleToFreeD(double deg)
+float resolveAspect(double hf_ar)
 {
-    const double scaled = std::round(deg * 32768.0);
-    return static_cast<std::int32_t>(std::clamp(scaled, -8388608.0, 8388607.0));
+    return (std::isfinite(hf_ar) && hf_ar > 0.0)
+        ? static_cast<float>(hf_ar)
+        : kDefaultAspect;
 }
 
-std::int32_t positionToFreeD(double mm)
+float resolvePaWidth(double hf_pa_width_mm)
 {
-    const double scaled = std::round(mm * 64.0);
-    return static_cast<std::int32_t>(std::clamp(scaled, -8388608.0, 8388607.0));
-}
-
-std::uint8_t freedChecksum(const std::uint8_t* bytes28)
-{
-    unsigned sum = 0;
-    for (int i = 0; i < 28; ++i)
-        sum += bytes28[i];
-    return static_cast<std::uint8_t>((0x40 - sum) & 0xFF);
+    return (std::isfinite(hf_pa_width_mm) && hf_pa_width_mm > 0.0)
+        ? static_cast<float>(hf_pa_width_mm)
+        : kDefaultPaWidthMm;
 }
 
 } // namespace
@@ -115,7 +118,7 @@ bool UdpSender::configure(const std::string& host, int port, std::string& error)
     status_.configured = true;
     status_.packets_sent = 0;
     status_.last_error.clear();
-    log()->info("UDP sender ready -> {}:{}", host, port);
+    log()->info("UDP sender ready -> {}:{} (Stype HF)", host, port);
     return true;
 }
 
@@ -128,28 +131,45 @@ bool UdpSender::sendRecord(const stype::Record& record, std::uint8_t camera_id)
     }
 
     std::uint8_t packet[kPacketLen] = {};
-    // STQ1 header (little-endian frame id + timestamp), matching UdpReceiver.
     std::memcpy(packet, kSyncMagic, 4);
     const auto frame_id = static_cast<std::uint32_t>(record.frame_id);
     const auto ts_ms = static_cast<std::uint64_t>(record.timestamp_ms);
     std::memcpy(packet + 4, &frame_id, sizeof(frame_id));
     std::memcpy(packet + 8, &ts_ms, sizeof(ts_ms));
 
-    std::uint8_t* freed = packet + kSyncHeaderLen;
-    freed[0] = kFreeDType;
-    freed[1] = camera_id;
-    encodeInt24(freed, 2, angleToFreeD(record.pan_deg));
-    encodeInt24(freed, 5, angleToFreeD(record.tilt_deg));
-    encodeInt24(freed, 8, angleToFreeD(record.roll_deg));
-    // Match UdpReceiver slot order: X @11, Z @14, Y @17.
-    encodeInt24(freed, 11, positionToFreeD(record.x_mm));
-    encodeInt24(freed, 14, positionToFreeD(record.z_mm));
-    encodeInt24(freed, 17, positionToFreeD(record.y_mm));
-    encodeUint24(freed, 20, static_cast<std::uint32_t>(std::max<std::int64_t>(0, record.zoom_raw)));
-    encodeUint24(freed, 23, static_cast<std::uint32_t>(std::max<std::int64_t>(0, record.focus_raw)));
-    freed[26] = 0;
-    freed[27] = 0;
-    freed[28] = freedChecksum(freed);
+    std::uint8_t* hf = packet + kSyncHeaderLen;
+    const float hfov = resolveHfov(record.hfov_deg);
+    const float aspect = resolveAspect(record.hf_ar);
+    const float pa_width = resolvePaWidth(record.hf_pa_width_mm);
+    const int zoom_raw = static_cast<int>(std::clamp(record.zoom_raw, std::int64_t{0},
+                                                     std::int64_t{65535}));
+    const int focus_raw = static_cast<int>(std::clamp(record.focus_raw, std::int64_t{0},
+                                                      std::int64_t{65535}));
+
+    hf[0] = kStypeHfType;
+    hf[1] = static_cast<std::uint8_t>(camera_id & 0x0F);
+    hf[5] = static_cast<std::uint8_t>(record.frame_id & 0xFF);
+
+    writeLeFloat(hf, 6, static_cast<float>(record.x_mm / 1000.0));
+    writeLeFloat(hf, 10, static_cast<float>(record.y_mm / 1000.0));
+    writeLeFloat(hf, 14, static_cast<float>(record.z_mm / 1000.0));
+    writeLeFloat(hf, 18, static_cast<float>(record.pan_deg));
+    writeLeFloat(hf, 22, static_cast<float>(record.tilt_deg));
+    writeLeFloat(hf, 26, static_cast<float>(record.roll_deg));
+    writeLeFloat(hf, 30, hfov);
+    writeLeFloat(hf, 34, aspect);
+    writeLeFloat(hf, 38, focus_raw / 65535.0f);
+    writeLeFloat(hf, 42, zoom_raw / 65535.0f);
+    writeLeFloat(hf, 46, static_cast<float>(record.hf_k1));
+    writeLeFloat(hf, 50, static_cast<float>(record.hf_k2));
+    writeLeFloat(hf, 54, static_cast<float>(record.hf_cx_mm));
+    writeLeFloat(hf, 58, static_cast<float>(record.hf_cy_mm));
+    writeLeFloat(hf, 62, pa_width);
+
+    std::uint8_t checksum = 0;
+    for (int i = 0; i < kStypeHfLen - 1; ++i)
+        checksum = static_cast<std::uint8_t>(checksum + hf[i]);
+    hf[kStypeHfLen - 1] = checksum;
 
     const ssize_t sent = ::send(socket_fd_, packet, sizeof(packet), 0);
     if (sent != static_cast<ssize_t>(sizeof(packet))) {

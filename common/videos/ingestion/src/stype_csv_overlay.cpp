@@ -242,35 +242,35 @@ bool project(const Camera& camera, double x, double y, double z, cv::Point& poin
     return true;
 }
 
-void drawText(cv::Mat& bgr, const Record& record, bool direct_fov)
-{
-    const std::array<std::string, 4> lines = {
-        "Stype " + std::string(record.stype_valid ? "VALID" : "INVALID") +
-            "  frame " + std::to_string(record.frame_id) +
-            "  t=" + std::to_string(record.timestamp_ms) + " ms",
-        cv::format("Pan %+6.2f  Tilt %+6.2f  Roll %+6.2f deg",
-                   record.pan_deg, record.tilt_deg, record.roll_deg),
-        cv::format("X %+7.3f  Y %+7.3f  Z %+7.3f m",
-                   record.x_mm / 1000.0, record.y_mm / 1000.0, record.z_mm / 1000.0),
-        direct_fov
-            ? cv::format("HFOV %.2f deg  zoom %lld  focus %lld",
-                         record.hfov_deg, static_cast<long long>(record.zoom_raw),
-                         static_cast<long long>(record.focus_raw))
-            : "HFOV unavailable: using fallback projection"};
-    constexpr int margin = 12;
-    constexpr int line_height = 22;
-    cv::rectangle(bgr, cv::Rect(5, 5, std::min(bgr.cols - 10, 560),
-                                margin + line_height * static_cast<int>(lines.size())),
-                  cv::Scalar(0, 0, 0), cv::FILLED);
-    const cv::Scalar status_color = record.stype_valid ? cv::Scalar(80, 255, 80)
-                                                        : cv::Scalar(0, 180, 255);
-    for (std::size_t i = 0; i < lines.size(); ++i)
-    {
-        cv::putText(bgr, lines[i], cv::Point(margin, margin + 8 + line_height * static_cast<int>(i)),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.52, i == 0 ? status_color : cv::Scalar(240, 240, 240),
-                    1, cv::LINE_AA);
-    }
-}
+// void drawText(cv::Mat& bgr, const Record& record, bool direct_fov)
+// {
+//     const std::array<std::string, 4> lines = {
+//         "Stype " + std::string(record.stype_valid ? "VALID" : "INVALID") +
+//             "  frame " + std::to_string(record.frame_id) +
+//             "  t=" + std::to_string(record.timestamp_ms) + " ms",
+//         cv::format("Pan %+6.2f  Tilt %+6.2f  Roll %+6.2f deg",
+//                    record.pan_deg, record.tilt_deg, record.roll_deg),
+//         cv::format("X %+7.3f  Y %+7.3f  Z %+7.3f m",
+//                    record.x_mm / 1000.0, record.y_mm / 1000.0, record.z_mm / 1000.0),
+//         direct_fov
+//             ? cv::format("HFOV %.2f deg  zoom %lld  focus %lld",
+//                          record.hfov_deg, static_cast<long long>(record.zoom_raw),
+//                          static_cast<long long>(record.focus_raw))
+//             : "HFOV unavailable: using fallback projection"};
+//     constexpr int margin = 12;
+//     constexpr int line_height = 22;
+//     cv::rectangle(bgr, cv::Rect(5, 5, std::min(bgr.cols - 10, 560),
+//                                 margin + line_height * static_cast<int>(lines.size())),
+//                   cv::Scalar(0, 0, 0), cv::FILLED);
+//     const cv::Scalar status_color = record.stype_valid ? cv::Scalar(80, 255, 80)
+//                                                         : cv::Scalar(0, 180, 255);
+//     for (std::size_t i = 0; i < lines.size(); ++i)
+//     {
+//         cv::putText(bgr, lines[i], cv::Point(margin, margin + 8 + line_height * static_cast<int>(i)),
+//                     cv::FONT_HERSHEY_SIMPLEX, 0.52, i == 0 ? status_color : cv::Scalar(240, 240, 240),
+//                     1, cv::LINE_AA);
+//     }
+// }
 
 } // namespace
 
@@ -383,7 +383,7 @@ void drawOverlay(cv::Mat bgr, const Record& record, const OverlayOptions& option
     cv::Point origin;
     if (!project(camera, 0.0, 0.0, 0.0, origin))
     {
-        drawText(bgr, aligned, aligned.hasDirectFov());
+        // drawText(bgr, aligned, aligned.hasDirectFov());
         cv::putText(bgr, "World origin behind camera", cv::Point(12, bgr.rows - 16),
                     cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 200, 255), 2, cv::LINE_AA);
         return;
@@ -414,7 +414,6 @@ void drawOverlay(cv::Mat bgr, const Record& record, const OverlayOptions& option
 
     cv::circle(bgr, origin, 7, cv::Scalar(255, 255, 255), cv::FILLED, cv::LINE_AA);
     cv::circle(bgr, origin, 7, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
-    drawText(bgr, aligned, aligned.hasDirectFov());
 }
 
 } // namespace stype

@@ -108,9 +108,24 @@ void RecordingPlayback::applyOverlay_()
     if (row >= 0 && row < static_cast<std::int64_t>(records_.size())) {
         active_record_ = records_[static_cast<std::size_t>(row)];
         has_record_ = true;
-        if (show_world_origin)
-            stype::drawOverlay(display_, active_record_, overlay_options);
     }
+
+    if (!show_world_origin)
+        return;
+
+    if (overlay_from_udp) {
+        if (!has_udp_overlay_record_)
+            return;
+        // UDP packets are already alignment-adjusted by the sender; do not
+        // apply AlignmentAdjust a second time when projecting.
+        stype::OverlayOptions opts = overlay_options;
+        opts.alignment = {};
+        stype::drawOverlay(display_, udp_overlay_record_, opts);
+        return;
+    }
+
+    if (has_record_)
+        stype::drawOverlay(display_, active_record_, overlay_options);
 }
 
 bool RecordingPlayback::open(const RecordingPair& pair, std::string& error)
@@ -161,6 +176,14 @@ bool RecordingPlayback::seek(int frame_index)
 void RecordingPlayback::refreshOverlay()
 {
     if (!frame_bgr_.empty())
+        applyOverlay_();
+}
+
+void RecordingPlayback::setUdpOverlayRecord(const stype::Record& record)
+{
+    udp_overlay_record_ = record;
+    has_udp_overlay_record_ = true;
+    if (overlay_from_udp && !frame_bgr_.empty())
         applyOverlay_();
 }
 

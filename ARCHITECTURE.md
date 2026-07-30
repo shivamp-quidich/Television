@@ -4,8 +4,9 @@
 
 Televison receives live UYVY 4:2:2 video from a Blackmagic DeckLink input,
 uploads it into a GPU-owned `FrameData::uyvy_frame`, previews it through
-CUDA–OpenGL interop, and sends UYVY frames to a DeckLink output. FreeD tracking
-packets can be received over UDP and are shown in the status panel. Still images
+CUDA–OpenGL interop, and sends UYVY frames to a DeckLink output. Stype HF
+tracking packets can be received over UDP and are shown in the status panel.
+Still images
 from `data/` can be selected and placed on the video with the mouse; multiple
 placements are supported and are optionally burned into the SDI output. A
 **Recording** source mode plays paired video + `*_stype.csv` files from a
@@ -81,12 +82,12 @@ flowchart TB
         ui_port["ImGui bind IP + port from [udp]"]
         bind["Bind configured IP:port"]
         recv["UdpReceiver background thread"]
-        freed["Unwrap optional 16-byte STQ1 header, parse 29-byte FreeD D1"]
-        pose["Latest CameraData + packet counters"]
+        hf["Unwrap optional 16-byte STQ1 header, parse 67-byte Stype HF 0x0F"]
+        pose["Latest CameraData + HF optics + packet counters"]
         plots["PlotLines from received history"]
         send["UdpSender: aligned CSV while recording plays"]
-        ui_port --> bind --> recv --> freed --> pose --> plots
-        send -->|"localhost FreeD"| bind
+        ui_port --> bind --> recv --> hf --> pose --> plots
+        send -->|"localhost Stype HF"| bind
     end
     pose --> statuspanel
 
@@ -184,11 +185,11 @@ owner releases its CUDA allocation:
 | `config/televison.ini` | Default operator configuration checked into the repo |
 | `common/videos/ingestion/include/gpu_uyvy_preview.hpp` | CUDA–OpenGL UYVY preview resource interface |
 | `common/videos/ingestion/src/gpu_uyvy_preview.cpp` | CUDA PBO mapping, device-to-device UYVY transfer, shader decode, and RGB preview texture |
-| `common/videos/ingestion/include/udp_receiver.hpp` | Local UDP FreeD D1 receiver interface |
-| `common/videos/ingestion/src/udp_receiver.cpp` | Background bind/recv thread, raw packet recording, and FreeD D1 decode of both bare and `STQ1`-wrapped datagrams |
-| `common/videos/ingestion/include/udp_sender.hpp` | Internal FreeD D1 (+ STQ1) UDP sender for recording CSV replay |
-| `common/videos/ingestion/src/udp_sender.cpp` | Encode aligned CSV pose and send to the receiver bind address |
-| `udpOut/udp_raw.txt` | Session-local readable UDP recording: one decoded FreeD pose per line |
+| `common/videos/ingestion/include/udp_receiver.hpp` | Local UDP Stype HF receiver interface |
+| `common/videos/ingestion/src/udp_receiver.cpp` | Background bind/recv thread, raw packet recording, and Stype HF (`0x0F`, 67-byte) decode of both bare and `STQ1`-wrapped datagrams |
+| `common/videos/ingestion/include/udp_sender.hpp` | Internal Stype HF (+ STQ1) UDP sender for recording CSV replay |
+| `common/videos/ingestion/src/udp_sender.cpp` | Encode aligned CSV pose/optics as Stype HF and send to the receiver bind address |
+| `udpOut/udp_raw.txt` | Session-local readable UDP recording: one decoded Stype HF pose per line |
 | `common/videos/ingestion/include/stype_csv_overlay.hpp` | Stype CSV record + world-origin gizmo projection (stype_player maths) |
 | `common/videos/ingestion/src/stype_csv_overlay.cpp` | CSV load and HF/pinhole world→pixel overlay draw |
 | `common/videos/ingestion/include/recording_playback.hpp` | Paired recording browser + OpenCV video/CSV player |
@@ -232,27 +233,29 @@ UDP receive:
   edited in the UI; **Apply UDP** rebinds the receiver and reconfigures the
   internal sender; **Save config** persists `send_port` / `send_ip`;
 - while a recording is **Play**ing and **UDP send CSV while playing** is on, each
-  advanced frame encodes the aligned CSV pose as FreeD D1 (STQ1-wrapped) and
-  sends it to the receiver bind address; paused recording stops sending;
+  advanced frame encodes the aligned CSV pose and HF optics as Stype HF
+  (STQ1-wrapped) and sends it to the receiver bind address; paused recording
+  stops sending; missing CSV optics fall back to HFOV 40°, AR 16:9, PA width
+  9.6 mm so a packet can still be built;
 - the panel shows listening state, recv/send packet counts, bind errors, and the
-  latest decoded FreeD D1 pose when a valid packet arrives;
-- **Recv delay (ms)** (`recv_delay_ms`, slider 0–2000) holds each FreeD pose
+  latest decoded Stype HF pose when a valid packet arrives;
+- **Recv delay (ms)** (`recv_delay_ms`, slider 0–2000) holds each Stype HF pose
   until that many milliseconds have elapsed since arrival, so plots and the
   delayed pose readout can be lagged to match video;
 - **UDP received plots** chart pan/tilt/roll and X/Y/Z from the *delayed*
   received stream (not the CSV file directly);
-- two datagram shapes are accepted: the bare 29-byte FreeD D1 payload a real
-  tracking source sends, and the 45-byte form the Stype simulator / internal
-  sender produce, which prefixes the same payload with a 16-byte sync header of
-  `"STQ1"`, a little-endian `uint32` frame id, and a little-endian `uint64`
-  timestamp;
-- every valid FreeD datagram is decoded into a readable line in the configured
+- two datagram shapes are accepted: the bare 67-byte Stype HF (`0x0F`) payload a
+  real tracking source sends, and the 83-byte form the internal sender produces,
+  which prefixes the same payload with a 16-byte sync header of `"STQ1"`, a
+  little-endian `uint32` frame id, and a little-endian `uint64` timestamp;
+- every valid Stype HF datagram is decoded into a readable line in the configured
   `raw_output_path` (default `udpOut/udp_raw.txt`). Invalid datagrams are
   retained as decimal byte values.
 
-Pose telemetry is reported in the UDP section of the panel: camera id, zoom and
-focus, pan/tilt/roll, X / Y / Z(depth) in metres, and the ground distance to the
-world origin.
+Pose telemetry is reported in the UDP section of the panel: camera id, packet
+number, zoom and focus, pan/tilt/roll, X / Y / Z(depth) in metres, ground
+distance to the world origin, and Stype HF optics (HFOV, aspect ratio, PA
+width, k1/k2, cx/cy).
 
 Graphic overlay:
 
