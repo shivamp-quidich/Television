@@ -274,6 +274,18 @@ void drawText(cv::Mat& bgr, const Record& record, bool direct_fov)
 
 } // namespace
 
+Record applyAlignment(const Record& record, const AlignmentAdjust& alignment)
+{
+    Record out = record;
+    out.pan_deg = record.pan_deg * static_cast<double>(alignment.sign_pan) + alignment.add_pan_deg;
+    out.tilt_deg = record.tilt_deg * static_cast<double>(alignment.sign_tilt) + alignment.add_tilt_deg;
+    out.roll_deg = record.roll_deg * static_cast<double>(alignment.sign_roll) + alignment.add_roll_deg;
+    out.x_mm = record.x_mm * static_cast<double>(alignment.sign_x) + alignment.add_x_mm;
+    out.y_mm = record.y_mm * static_cast<double>(alignment.sign_y) + alignment.add_y_mm;
+    out.z_mm = record.z_mm * static_cast<double>(alignment.sign_z) + alignment.add_z_mm;
+    return out;
+}
+
 bool loadCsv(const std::string& path, Records& records, std::string* error)
 {
     std::ifstream input(path);
@@ -366,11 +378,12 @@ void drawOverlay(cv::Mat bgr, const Record& record, const OverlayOptions& option
     if (bgr.empty() || bgr.type() != CV_8UC3 || options.gizmo_length_mm <= 0.0)
         return;
 
-    const Camera camera = buildCamera(record, options, bgr.cols, bgr.rows);
+    const Record aligned = applyAlignment(record, options.alignment);
+    const Camera camera = buildCamera(aligned, options, bgr.cols, bgr.rows);
     cv::Point origin;
     if (!project(camera, 0.0, 0.0, 0.0, origin))
     {
-        drawText(bgr, record, record.hasDirectFov());
+        drawText(bgr, aligned, aligned.hasDirectFov());
         cv::putText(bgr, "World origin behind camera", cv::Point(12, bgr.rows - 16),
                     cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 200, 255), 2, cv::LINE_AA);
         return;
@@ -398,9 +411,10 @@ void drawOverlay(cv::Mat bgr, const Record& record, const OverlayOptions& option
         cv::putText(bgr, axis.label, end + cv::Point(8, 5), cv::FONT_HERSHEY_SIMPLEX,
                     0.8, axis.color, 2, cv::LINE_AA);
     }
+
     cv::circle(bgr, origin, 7, cv::Scalar(255, 255, 255), cv::FILLED, cv::LINE_AA);
     cv::circle(bgr, origin, 7, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
-    drawText(bgr, record, record.hasDirectFov());
+    drawText(bgr, aligned, aligned.hasDirectFov());
 }
 
 } // namespace stype

@@ -39,11 +39,45 @@ using Records = std::vector<Record>;
 // supplied, receives an actionable parse/open error.
 bool loadCsv(const std::string& path, Records& records, std::string* error = nullptr);
 
+struct AlignmentAdjust {
+    // Per-axis sign (+1 / -1). Clicking + or - in the Apply Alignment panel
+    // sets the corresponding sign; used every frame when projecting the origin.
+    int sign_pan = +1;
+    int sign_tilt = +1;
+    int sign_roll = +1;
+    int sign_x = +1;
+    int sign_y = +1;
+    int sign_z = +1;
+
+    // Additive offsets applied after the sign (degrees / millimetres).
+    double add_pan_deg = 0.0;
+    double add_tilt_deg = 0.0;
+    double add_roll_deg = 0.0;
+    double add_x_mm = 0.0;
+    double add_y_mm = 0.0;
+    double add_z_mm = 0.0;
+
+    double angle_step_deg = 0.5;
+    double position_step_mm = 50.0;
+
+    void reset()
+    {
+        sign_pan = sign_tilt = sign_roll = +1;
+        sign_x = sign_y = sign_z = +1;
+        add_pan_deg = add_tilt_deg = add_roll_deg = 0.0;
+        add_x_mm = add_y_mm = add_z_mm = 0.0;
+    }
+};
+
 struct OverlayOptions {
     double gizmo_length_mm = 500.0;
     double fallback_vfov_deg = 25.0;
     bool apply_distortion = true;
+    AlignmentAdjust alignment;
 };
+
+// Applies sign + offset to a tracking row (does not mutate the CSV source).
+Record applyAlignment(const Record& record, const AlignmentAdjust& alignment);
 
 // Draws the world-origin XYZ axes and a compact tracking readout in-place on a
 // BGR frame. A direct Stype HF horizontal FOV is used when present; otherwise

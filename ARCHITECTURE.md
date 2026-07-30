@@ -4,22 +4,25 @@
 
 Televison receives live UYVY 4:2:2 video from a Blackmagic DeckLink input,
 uploads it into a GPU-owned `FrameData::uyvy_frame`, previews it through
-CUDA–OpenGL interop, and sends UYVY frames to a DeckLink output. Poses received
-over UDP are visualized as a 3D camera-trajectory overlay that is drawn on the
-preview and optionally burned into the outgoing SDI pixels. CSV tracking is
-currently disabled.
+CUDA–OpenGL interop, and sends UYVY frames to a DeckLink output. FreeD tracking
+packets can be received over UDP and are shown in the status panel. Still images
+from `data/` can be selected and placed on the video with the mouse; multiple
+placements are supported and are optionally burned into the SDI output. A
+**Recording** source mode plays paired video + `*_stype.csv` files from a
+stype_handover recordings folder and draws the world-origin XYZ gizmo.
 
 ## Whole-application flow chart
 
 ```mermaid
 flowchart TB
     subgraph startup["Startup (main)"]
-        args["argv: input-device, output-device"]
-        glfw["GLFW window, OpenGL 3.3 core context"]
+        cfg["Load config/televison.ini (or --config / TELEVISON_CONFIG)"]
+        args["optional argv device overrides"]
+        glfw["GLFW window from [window] section"]
         imgui["ImGui context and GLFW/OpenGL3 backends"]
         create["CreateIngest -> DeckLinkIngest, initialize, startCapture"]
-        args --> create
-        glfw --> imgui
+        cfg --> args --> create
+        cfg --> glfw --> imgui
     end
 
     subgraph capture["DeckLink capture thread"]
@@ -55,7 +58,7 @@ flowchart TB
 
     subgraph outputpath["Output path"]
         d2h["copyFrameToHost: cudaMemcpy2D D2H into staging vector"]
-        burn["burnOverlayIntoStagedFrame: UYVY-to-BGR, draw, BGR-to-UYVY (optional)"]
+        burn["optional: burn placed graphic into UYVY via BGR round-trip"]
         send["IIngest::sendFrameToOutput"]
         sched["DeckLink scheduled playback frame pool"]
         sdi_out["SDI output signal"]
@@ -74,19 +77,45 @@ flowchart TB
     statuspanel --> swap
     fd -.->|"shared_ptr released at end of iteration"| free["UYVYFrame destructor frees the CUDA buffer"]
 
-    subgraph udp["UDP tracking receive"]
-        ui_port["ImGui port control (default 6305)"]
-        bind["Bind 127.0.0.1:port"]
+    subgraph udp["UDP tracking loopback"]
+        ui_port["ImGui bind IP + port from [udp]"]
+        bind["Bind configured IP:port"]
         recv["UdpReceiver background thread"]
         freed["Unwrap optional 16-byte STQ1 header, parse 29-byte FreeD D1"]
         pose["Latest CameraData + packet counters"]
-        trail["camera_trail deque, one sample per new packet"]
-        geom["buildCameraTrajectoryGeometry: grid, trail, frustum web, heading vector"]
-        ui_port --> bind --> recv --> freed --> pose --> trail --> geom
+        plots["PlotLines from received history"]
+        send["UdpSender: aligned CSV while recording plays"]
+        ui_port --> bind --> recv --> freed --> pose --> plots
+        send -->|"localhost FreeD"| bind
     end
     pose --> statuspanel
-    geom -->|"ImDrawList, preview pixel rect"| image
-    geom -->|"cv::Mat, full frame rect"| burn
+
+    subgraph recording["Recording playback"]
+        pairs["List video + *_stype.csv in recordings_dir"]
+        vcap["OpenCV VideoCapture"]
+        csvload["stype::loadCsv"]
+        gizmo["drawOverlay: world-origin XYZ gizmo"]
+        rectex["Upload BGR to GL texture -> ImGui"]
+        recsdi["BGR→UYVY (+ optional graphic burn) → DeckLink SDI"]
+        pairs --> vcap --> gizmo --> rectex
+        pairs --> csvload --> gizmo
+        gizmo --> recsdi
+        gizmo -->|"while playing"| send
+    end
+    rectex --> image
+    recsdi --> sdi_out
+
+    subgraph graphic["Graphic overlay"]
+        pick["Pick image from data/"]
+        gltex["Load RGBA OpenGL texture"]
+        hover["Yellow polygon follows mouse"]
+        click["Click adds a placed graphic"]
+        list["Accumulate multiple placements"]
+        preview_draw["ImGui AddImage for each placed + pending"]
+        pick --> gltex --> hover --> click --> list --> preview_draw
+    end
+    preview_draw --> image
+    list -->|"burn_into_sdi"| burn
 ```
 
 Video pixels stay in CUDA device memory from the ingest upload through the
@@ -97,19 +126,10 @@ The output path runs after the preview path for the same frame and is gated on
 it: a frame is staged and scheduled for SDI only when `GpuUyvyPreview::update`
 reported success for that frame, so a broken preview stops SDI output instead of
 letting the two paths diverge. The output forwards the ingested UYVY buffer, not
-the preview's RGB result.
-
-The trajectory overlay is the one exception to the GPU-resident rule. When
-**Burn into SDI output** is enabled and a valid pose is available, the already
-staged host buffer is converted to BGR, drawn on with OpenCV, and converted back
-into the same pitched UYVY memory. Two conversions plus the drawing cost about
-6 ms per 1080p frame, which fits a 25/50 fps budget but is real CPU work; turning
-the burn-in off restores an untouched pass-through. The conversion writes only
-the active `width × 2` bytes of each row, so DeckLink row padding is preserved.
-
-The preview does not read the burned frame back. It draws the same geometry with
-`ImDrawList` at the preview's own pixel rect, so the operator sees the overlay
-even when the burn-in is disabled, and enabling it costs no extra readback.
+the preview's RGB result. When any graphics are placed and **Burn into SDI** is
+on, the staged host buffer is converted to BGR, each placed PNG/JPEG is
+alpha-composited at its position, and the result is converted back to pitched
+UYVY.
 
 Two details are easy to get wrong when modifying the preview:
 
@@ -158,121 +178,124 @@ owner releases its CUDA allocation:
 | --- | --- |
 | `common/videos/ingestion/src/decklink_capture.cpp` | DeckLink device discovery, capture callbacks, format detection, scheduled SDI playback, genlock status |
 | `common/videos/ingestion/src/ingest.cpp` | `IIngest` GPU-frame adapter; retained for application integrations outside the UI executable |
-| `common/videos/ingestion/src/main.cpp` | IIngest/FrameData lifecycle, frame metadata, shared state, GPU preview, and output staging |
+| `common/videos/ingestion/src/main.cpp` | IIngest/FrameData lifecycle, config load/save, GPU preview, and output staging |
+| `common/videos/ingestion/include/app_config.hpp` | INI-backed `AppConfig` for DeckLink, UDP, window, graphic, recording |
+| `common/videos/ingestion/src/app_config.cpp` | Load/save and path resolution for `config/televison.ini` |
+| `config/televison.ini` | Default operator configuration checked into the repo |
 | `common/videos/ingestion/include/gpu_uyvy_preview.hpp` | CUDA–OpenGL UYVY preview resource interface |
 | `common/videos/ingestion/src/gpu_uyvy_preview.cpp` | CUDA PBO mapping, device-to-device UYVY transfer, shader decode, and RGB preview texture |
 | `common/videos/ingestion/include/udp_receiver.hpp` | Local UDP FreeD D1 receiver interface |
-| `common/videos/ingestion/src/udp_receiver.cpp` | Background bind/recv thread for `127.0.0.1` (default port 6305), raw packet recording, and FreeD D1 decode of both bare and `STQ1`-wrapped datagrams |
+| `common/videos/ingestion/src/udp_receiver.cpp` | Background bind/recv thread, raw packet recording, and FreeD D1 decode of both bare and `STQ1`-wrapped datagrams |
+| `common/videos/ingestion/include/udp_sender.hpp` | Internal FreeD D1 (+ STQ1) UDP sender for recording CSV replay |
+| `common/videos/ingestion/src/udp_sender.cpp` | Encode aligned CSV pose and send to the receiver bind address |
 | `udpOut/udp_raw.txt` | Session-local readable UDP recording: one decoded FreeD pose per line |
-| `common/videos/ingestion/include/camera_trajectory_overlay.hpp` | Renderer-independent overlay primitives and the ImGui/OpenCV drawing entry points |
-| `common/videos/ingestion/src/camera_trajectory_overlay.cpp` | Isometric projection of pose and trail into lines/circles/labels, plus the ImGui and BGR renderers |
-| `common/videos/ingestion/include/stype_csv_overlay.hpp` | CSV record contract and tracking-overlay interface; not used by the current executable. |
-| `common/videos/ingestion/src/stype_csv_overlay.cpp` | Stype HF/FreeD CSV parsing and world-origin gizmo projection; not built into the current executable. |
-| `csv/` | Reserved location for tracking recordings; not read by the current executable. |
+| `common/videos/ingestion/include/stype_csv_overlay.hpp` | Stype CSV record + world-origin gizmo projection (stype_player maths) |
+| `common/videos/ingestion/src/stype_csv_overlay.cpp` | CSV load and HF/pinhole world→pixel overlay draw |
+| `common/videos/ingestion/include/recording_playback.hpp` | Paired recording browser + OpenCV video/CSV player |
+| `common/videos/ingestion/src/recording_playback.cpp` | List pairs, play/seek, sync CSV row, refresh gizmo |
+| `common/videos/ingestion/include/graphic_overlay.hpp` | OpenGL graphic overlay: data/ picker, multi-placement, SDI burn-in |
+| `common/videos/ingestion/src/graphic_overlay.cpp` | Load images to GL textures, draw/place multiple, alpha-composite for SDI |
+| `data/` | Still images (png/jpg/…) selectable as graphics |
 | `third_party/Decklink-SDK` | DeckLink headers and dynamic API dispatch source |
 | `third_party/imgui-package` | Project-local ImGui 1.90.1 package used by the GLFW/OpenGL GUI |
 
 ## Operator controls
 
-The right-hand ImGui panel displays DeckLink input/output status, the UDP
-receiver controls, and the trajectory overlay controls. CSV selection, CSV plots,
-tracking state, and the CSV-derived frame overlay remain temporarily disabled.
+Startup settings come from `config/televison.ini` (or a path given with
+`--config`, `TELEVISON_CONFIG`, or a positional `.ini` argument). The file
+covers:
+
+| Section | Keys |
+| --- | --- |
+| `[decklink]` | `input_device`, `output_device` |
+| `[udp]` | `bind_ip`, `port` (receive), `send_ip`, `send_port` (internal sender), `recv_delay_ms`, `raw_output_path` |
+| `[window]` | `width`, `height`, `title` |
+| `[graphic]` | `data_dir` |
+| `[recording]` | `recordings_dir` (video + `*_stype.csv` pairs) |
+
+Integer CLI arguments still override the DeckLink devices for a one-off run:
+
+```bash
+decklink_passthrough                  # use config/televison.ini
+decklink_passthrough 0 2              # override input/output only
+decklink_passthrough --config ./my.ini
+decklink_passthrough --config ./my.ini 1 3
+```
+
+The right-hand ImGui panel shows the loaded config path, the active DeckLink
+indices, and a **Save config** button that writes the current UDP values back to
+the file.
 
 UDP receive:
 
-- bind IP is fixed to local `127.0.0.1` for now;
-- port defaults to `6305` and can be changed in the UI with **Apply UDP port**;
-- the panel shows listening state, packet counts, bind errors, and the latest
-  decoded FreeD D1 pose when a valid packet arrives;
+- bind IP / recv port and send IP / send port default from `[udp]` and can be
+  edited in the UI; **Apply UDP** rebinds the receiver and reconfigures the
+  internal sender; **Save config** persists `send_port` / `send_ip`;
+- while a recording is **Play**ing and **UDP send CSV while playing** is on, each
+  advanced frame encodes the aligned CSV pose as FreeD D1 (STQ1-wrapped) and
+  sends it to the receiver bind address; paused recording stops sending;
+- the panel shows listening state, recv/send packet counts, bind errors, and the
+  latest decoded FreeD D1 pose when a valid packet arrives;
+- **Recv delay (ms)** (`recv_delay_ms`, slider 0–2000) holds each FreeD pose
+  until that many milliseconds have elapsed since arrival, so plots and the
+  delayed pose readout can be lagged to match video;
+- **UDP received plots** chart pan/tilt/roll and X/Y/Z from the *delayed*
+  received stream (not the CSV file directly);
 - two datagram shapes are accepted: the bare 29-byte FreeD D1 payload a real
-  tracking source sends, and the 45-byte form the Stype simulator produces,
-  which prefixes the same payload with a 16-byte sync header of `"STQ1"`, a
-  little-endian `uint32` frame id, and a little-endian `uint64` timestamp.
-  Rejecting the wrapped form leaves the overlay permanently blank, because it
-  only draws once a pose has decoded;
-- every valid FreeD datagram is decoded into a readable line containing camera
-  ID, pan, tilt, roll, X/Y/Z millimetres, zoom, and focus in
-  `/home/quidich/Televison/udpOut/udp_raw.txt`. Invalid datagrams are retained as
-  decimal byte values. Starting the application or applying a UDP port starts a
-  new session and truncates the previous file before receiving packets.
+  tracking source sends, and the 45-byte form the Stype simulator / internal
+  sender produce, which prefixes the same payload with a 16-byte sync header of
+  `"STQ1"`, a little-endian `uint32` frame id, and a little-endian `uint64`
+  timestamp;
+- every valid FreeD datagram is decoded into a readable line in the configured
+  `raw_output_path` (default `udpOut/udp_raw.txt`). Invalid datagrams are
+  retained as decimal byte values.
 
-Trajectory overlay:
+Pose telemetry is reported in the UDP section of the panel: camera id, zoom and
+focus, pan/tilt/roll, X / Y / Z(depth) in metres, and the ground distance to the
+world origin.
 
-- **Show overlay** enables the visualization; it is drawn only while a valid
-  FreeD pose has been received;
-- **Burn into SDI output** decides whether the outgoing frames carry the overlay.
-  The preview always shows it, so this toggle only changes what leaves the card;
-- **Ground grid** toggles the floor grid and world axes, and **Ground plane**
-  sets the height they sit at, which is viz3d's `world_origin_y_mm`;
-- **Frustum web** toggles the camera cone. While it is on, **Cone angle** sets
-  the half-angle between 1 and 60 degrees, **Web length** sets the ray length as
-  1 to 100 percent of the framed trail span, and **Reset frustum** restores the
-  `viz3d.py` defaults of 14 degrees and 15 percent. Both sliders grey out when
-  the web is off;
-- **Trail length** caps the retained pose history (default 1000 samples, one per
-  new packet), and **Clear trail** discards it;
-- left-clicking the preview picture places the scene at that point, and
-  **Centre scene** returns it to the middle of the frame. The click is recorded
-  in normalized coordinates, so the burned SDI frame matches the preview.
+Graphic overlay:
 
-Pose telemetry is deliberately not drawn on the video. It is reported in the UDP
-section of the panel, in the same fields viz3d puts in its read-out bar: camera
-id, zoom and focus, pan/tilt/roll, X / Y / Z(depth) in metres, and the ground
-distance to the world origin.
+- **Refresh data/** rescans the `data/` folder for png/jpg/jpeg/bmp/webp/tga;
+- selecting a file loads it as the pending OpenGL RGBA texture (follow-mouse);
+- while pending, a yellow polygon the size of the scaled image follows the mouse;
+- each left-click on the video (Live or Recording) adds one placed graphic at
+  that point (normalized coordinates so preview and SDI agree), then clears
+  pending — select the same or another image from the combo to place again;
+- **Width fraction** sets the size of the *next* placement as a fraction of
+  frame width (aspect ratio preserved; each placed item keeps the size used
+  when it was clicked);
+- **Burn into SDI** composites every placed graphic into the outgoing UYVY;
+- the status panel lists placements with **Remove**; **Cancel pending** drops
+  the follow-mouse image; **Clear all graphics** removes every placement.
 
-The visualization is an isometric 3D view that follows the conventions of
-`stype_sim/viz3d.py`, so the two show the same scene:
+Recording playback (stype_player-style):
 
-- world **Y is height**; plot space is `(world X, world Z, world Y)`. Treating
-  world Z as up tips the whole scene on its side;
-- the camera basis is built exactly as `projection.build_camera_basis` does
-  (look/right/down, with roll applied to the right vector by Rodrigues) and is
-  then swapped into plot space;
-- the frustum is a cone of 8 rays at a 14 degree half-angle joined by a rim,
-  which is the "spider web" shape, not a rectangular pyramid;
-- the trail runs along the `cool` colormap, cyan for the oldest sample through
-  magenta for the newest, and the camera marker is orange.
+- layout: **Apply Alignment** (left) | **Video Preview** (center) | **Application Status** (right);
+- **Apply Alignment** dials pan/tilt/roll and X/Y/Z for the world-origin gizmo:
+  each axis has a **+** button that multiplies that sign by -1 (+1 ↔ -1);
+- **Source** radio switches between **Live DeckLink** and **Recording**;
+- **Refresh recordings** scans `[recording] recordings_dir` (editable in the
+  panel) for `.mp4` / `.mkv` / `.mov` / `.avi` files that have a matching
+  `{stem}_stype.csv` sidecar (default `/home/quidich/stype_handover/recordings`);
+  the **Video** combo lists filenames including the extension;
+- selecting a pair loads the OpenCV video and CSV, switches to Recording mode,
+  and draws the world-origin XYZ gizmo via the same projection maths as
+  `stype_handover/scripts/stype_player.py`;
+- **Play / Pause / Prev / Next / Restart**, frame scrub, **CSV offset**,
+  **Show world origin**, gizmo length, and k1/k2 distortion toggle;
+- live DeckLink capture is paused while Recording is selected; recording frames
+  are converted to UYVY and sent on the DeckLink SDI output (scaled to the
+  enabled output mode when needed). **SDI out** toggles that path;
+- graphic overlay placement uses the same click / pending / multi-place rules
+  on the recording preview as on live; **Burn into SDI** composites placed
+  graphics into the recording output as well.
 
-Every length is a fraction of the framed trail rather than a fixed distance:
-the frustum defaults to 15% and the heading arrow to 20% of the trail span,
-matching the reference's 6 m and 8 m against a roughly 40 m trail. The ground
-grid spacing snaps to a 1/2/5 x 10^n step covering about a fifth of the span.
-This matters because real tracking data ranges from a few metres in a studio to
-the tens of metres seen on the SDI feed here; fixed sizes collapse to invisible
-specks at stadium scale.
-
-### The scene is static, the camera moves
-
-viz3d splits its drawing into a static layer (trail, grid, origin, and the axis
-limits) that is re-rendered only when the trail grows substantially, and a
-dynamic layer (camera marker, look arrow, frustum) redrawn every tick. The
-overlay reproduces that split without the caching: the projection is derived
-**only from the trail bounds**, padded exactly as viz3d pads its axis limits, so
-the live pose has no influence on the framing. The camera marker, arrow, and
-cone then travel across a stationary grid.
-
-This is load-bearing. Fitting the projection to the live pose instead makes the
-grid and trail slide around underneath a camera that appears pinned, which reads
-as the world moving rather than the camera. With the trail held fixed and only
-the pose advancing, the world origin and grid stay put to within 0.01 px while
-the camera marker travels several hundred pixels.
-
-The scene's position on screen is the operator's to choose: `anchor_u`/`anchor_v`
-place the centre of the padded view box, and the projection scale is then the
-largest that still fits that box into the picture-safe area, measured as the room
-on each side of the anchor. The anchor is clamped to keep at least 12% of the
-content box on every side. An anchor pushed into a corner therefore shrinks the
-drawing, which is the intended trade-off; flooring the room instead of the anchor
-would let the drawing spill out of frame.
-
-The ground grid and world origin axes may still extend past the fitted box and
-are clipped to the video rectangle, mirroring how the reference sets its limits
-from the trail while drawing its grid wider.
-
-Input and output device indices remain command-line arguments:
+DeckLink device indices default from `[decklink]` and may be overridden on the
+command line as shown above.
 
 ```bash
-decklink_passthrough [input-device=0] [output-device=1]
+decklink_passthrough [input-device] [output-device]
 ```
 
 ## Runtime requirements

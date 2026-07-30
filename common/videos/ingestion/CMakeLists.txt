@@ -116,7 +116,11 @@ if (BUILD_DECKLINK_PASSTHROUGH)
         src/main.cpp
         src/gpu_uyvy_preview.cpp
         src/udp_receiver.cpp
-        src/camera_trajectory_overlay.cpp
+        src/udp_sender.cpp
+        src/app_config.cpp
+        src/graphic_overlay.cpp
+        src/stype_csv_overlay.cpp
+        src/recording_playback.cpp
     )
     target_link_libraries(decklink_passthrough PRIVATE
         ingestion
