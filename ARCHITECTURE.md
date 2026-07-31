@@ -113,14 +113,17 @@ flowchart TB
     subgraph graphic["Graphic overlay"]
         pick["Pick image from data/"]
         gltex["Load RGBA OpenGL texture"]
-        hover["Yellow polygon follows mouse"]
-        click["Click adds a placed graphic"]
+        hover["Yellow ground/screen ghost follows mouse"]
+        click["Click places screen UV or world XYZ"]
         list["Accumulate multiple placements"]
-        preview_draw["ImGui AddImage for each placed + pending"]
-        pick --> gltex --> hover --> click --> list --> preview_draw
+        project["Plane grid: sponsor_tracker transform → H → place/warp image"]
+        preview_draw["ImGui AddImage / AddImageQuad for placed + pending"]
+        pick --> gltex --> hover --> click --> list --> project --> preview_draw
     end
     preview_draw --> image
     list -->|"burn_into_sdi"| burn
+    csvload --> project
+    pose --> project
 ```
 
 Video pixels stay in CUDA device memory from the ingest upload through the
@@ -132,9 +135,10 @@ it: a frame is staged and scheduled for SDI only when `GpuUyvyPreview::update`
 reported success for that frame, so a broken preview stops SDI output instead of
 letting the two paths diverge. The output forwards the ingested UYVY buffer, not
 the preview's RGB result. When any graphics are placed and **Burn into SDI** is
-on, the staged host buffer is converted to BGR, each placed PNG/JPEG is
-alpha-composited at its position, and the result is converted back to pitched
-UYVY.
+on, the staged host buffer is converted to BGR; screen-space placements are
+alpha-blitted at fixed UVs, while world-space placements are perspective-warped
+from the current Stype pose (same HFOV / k1/k2 path as the world-origin gizmo),
+and the result is converted back to pitched UYVY.
 
 Two details are easy to get wrong when modifying the preview:
 
@@ -194,12 +198,12 @@ owner releases its CUDA allocation:
 | `common/videos/ingestion/include/udp_sender.hpp` | Internal Stype HF (+ STQ1) UDP sender for recording CSV replay |
 | `common/videos/ingestion/src/udp_sender.cpp` | Encode aligned CSV pose/optics as Stype HF and send to the receiver bind address |
 | `udpOut/udp_raw.txt` | Session-local readable UDP recording: one decoded Stype HF pose per line |
-| `common/videos/ingestion/include/stype_csv_overlay.hpp` | Stype CSV record + world-origin gizmo projection (stype_player maths) |
-| `common/videos/ingestion/src/stype_csv_overlay.cpp` | CSV load and HF/pinhole world→pixel overlay draw |
+| `common/videos/ingestion/include/stype_csv_overlay.hpp` | Stype CSV record, world-origin gizmo, `projectWorldPoint` / `unprojectToGround` |
+| `common/videos/ingestion/src/stype_csv_overlay.cpp` | CSV load; HF/pinhole camera; world↔pixel with Apply Alignment + k1/k2 |
 | `common/videos/ingestion/include/recording_playback.hpp` | Paired recording browser + OpenCV video/CSV player |
 | `common/videos/ingestion/src/recording_playback.cpp` | List pairs, play/seek, sync CSV row, refresh gizmo |
-| `common/videos/ingestion/include/graphic_overlay.hpp` | OpenGL graphic overlay: data/ picker, multi-placement, SDI burn-in |
-| `common/videos/ingestion/src/graphic_overlay.cpp` | Load images to GL textures, draw/place multiple, alpha-composite for SDI |
+| `common/videos/ingestion/include/graphic_overlay.hpp` | Plane-grid graphic overlay (sponsor_tracker alignment math) |
+| `common/videos/ingestion/src/graphic_overlay.cpp` | Grid transform, plane placement, ImGui draw + SDI warp |
 | `data/` | Still images (png/jpg/…) selectable as graphics |
 | `third_party/Decklink-SDK` | DeckLink headers and dynamic API dispatch source |
 | `third_party/imgui-package` | Project-local ImGui 1.90.1 package used by the GLFW/OpenGL GUI |
@@ -265,22 +269,26 @@ Graphic overlay:
 
 - **Refresh data/** rescans the `data/` folder for png/jpg/jpeg/bmp/webp/tga;
 - selecting a file loads it as the pending OpenGL RGBA texture (follow-mouse);
-- while pending, a yellow polygon the size of the scaled image follows the mouse;
-- each left-click on the video (Live or Recording) adds one placed graphic at
-  that point (normalized coordinates so preview and SDI agree), then clears
-  pending — select the same or another image from the combo to place again;
-- **Width fraction** sets the size of the *next* placement as a fraction of
-  frame width (aspect ratio preserved; each placed item keeps the size used
-  when it was clicked);
+- **Plane grid placement**: **Align Grid** shows the sponsor_tracker-style mesh
+  (offset/depth/rotate/pitch/roll); **Apply Grid** hides the mesh but keeps the
+  plane for placement; with UDP/CSV pose the plane corners are unprojected to
+  the ground (world origin frame) so placed graphics reproject each frame with
+  the same camera model as the world-origin gizmo; **Edit Grid** returns to
+  alignment; screen-UV mode remains when plane grid is off;
+- each left-click commits one placement then clears pending — select again to
+  place another;
 - **Burn into SDI** composites every placed graphic into the outgoing UYVY;
-- the status panel lists placements with **Remove**; **Cancel pending** drops
-  the follow-mouse image; **Clear all graphics** removes every placement.
+- the status panel lists placements (world mm or UV) with **Remove**;
+  **Cancel pending** / **Clear all graphics** as before.
 
 Recording playback (stype_player-style):
 
 - layout: **Apply Alignment** (left) | **Video Preview** (center) | **Application Status** (right);
 - **Apply Alignment** dials pan/tilt/roll and X/Y/Z for the world-origin gizmo:
   each axis has a **+** button that multiplies that sign by -1 (+1 ↔ -1);
+  **Position offset** nudges X/Y/Z in millimetres (− / drag / +) after the sign,
+  and **Angle offset** does the same for pan/tilt/roll in degrees — used every
+  frame on both Live UDP and Recording overlays;
 - **Source** radio switches between **Live DeckLink** and **Recording**;
   switching to Live stops playback, disables recording SDI/UDP send, closes the
   open recording, and hides the Recording playback controls so only Live owns

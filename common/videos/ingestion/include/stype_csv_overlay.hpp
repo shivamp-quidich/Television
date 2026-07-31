@@ -79,9 +79,24 @@ struct OverlayOptions {
 // Applies sign + offset to a tracking row (does not mutate the CSV source).
 Record applyAlignment(const Record& record, const AlignmentAdjust& alignment);
 
-// Draws the world-origin XYZ axes and a compact tracking readout in-place on a
-// BGR frame. A direct Stype HF horizontal FOV is used when present; otherwise
-// fallback_vfov_deg supplies a simple pinhole camera approximation.
+// World (mm) → pixel using the same camera / HF distortion as drawOverlay.
+// Returns false when the point is behind the camera or out of numeric range.
+bool projectWorldPoint(const Record& record, const OverlayOptions& options,
+                       int image_width, int image_height,
+                       double x_mm, double y_mm, double z_mm,
+                       int& u, int& v);
+
+// Pixel → ground plane Y=0 intersection (mm), using the same camera model.
+// Undoes HF distortion when apply_distortion is set. Returns false when the
+// ray is parallel to the ground or the hit is behind the camera.
+bool unprojectToGround(const Record& record, const OverlayOptions& options,
+                       int image_width, int image_height,
+                       double pixel_u, double pixel_v,
+                       double& x_mm, double& y_mm, double& z_mm);
+
+// Draws the world-origin XYZ axes in-place on a BGR frame. A direct Stype HF
+// horizontal FOV is used when present; otherwise fallback_vfov_deg supplies a
+// simple pinhole camera approximation.
 void drawOverlay(cv::Mat bgr, const Record& record,
                  const OverlayOptions& options = OverlayOptions{});
 

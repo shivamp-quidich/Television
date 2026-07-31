@@ -286,6 +286,77 @@ Record applyAlignment(const Record& record, const AlignmentAdjust& alignment)
     return out;
 }
 
+bool projectWorldPoint(const Record& record, const OverlayOptions& options,
+                       int image_width, int image_height,
+                       double x_mm, double y_mm, double z_mm,
+                       int& u, int& v)
+{
+    if (image_width <= 0 || image_height <= 0)
+        return false;
+    const Record aligned = applyAlignment(record, options.alignment);
+    const Camera camera = buildCamera(aligned, options, image_width, image_height);
+    cv::Point point;
+    if (!project(camera, x_mm, y_mm, z_mm, point))
+        return false;
+    u = point.x;
+    v = point.y;
+    return true;
+}
+
+bool unprojectToGround(const Record& record, const OverlayOptions& options,
+                       int image_width, int image_height,
+                       double pixel_u, double pixel_v,
+                       double& x_mm, double& y_mm, double& z_mm)
+{
+    if (image_width <= 0 || image_height <= 0)
+        return false;
+
+    const Record aligned = applyAlignment(record, options.alignment);
+    const Camera camera = buildCamera(aligned, options, image_width, image_height);
+
+    double u = pixel_u;
+    double v = pixel_v;
+    // Clicks are in the distorted image. HF k1/k2 map distorted→ideal radius;
+    // convert to the ideal pinhole ray before intersecting the ground.
+    if (camera.px_per_mm > 0.0 && (camera.k1 != 0.0 || camera.k2 != 0.0))
+    {
+        const double ux = (u - camera.cx) / camera.px_per_mm;
+        const double uy = (v - camera.cy) / camera.px_per_mm;
+        const double distorted_radius = std::hypot(ux, uy);
+        if (distorted_radius > 1e-12)
+        {
+            const double radius2 = distorted_radius * distorted_radius;
+            const double ideal_radius = distorted_radius *
+                (1.0 + camera.k1 * radius2 + camera.k2 * radius2 * radius2);
+            if (!std::isfinite(ideal_radius))
+                return false;
+            const double ratio = ideal_radius / distorted_radius;
+            u = camera.cx + ux * ratio * camera.px_per_mm;
+            v = camera.cy + uy * ratio * camera.px_per_mm;
+        }
+    }
+
+    // Ideal pinhole ray in the camera frame (right, down, look).
+    const double x_cam = (u - camera.cx) / camera.fx;
+    const double y_cam = (v - camera.cy) / camera.fy;
+    const double z_cam = 1.0;
+    const double dir_x = camera.right[0] * x_cam + camera.down[0] * y_cam + camera.look[0] * z_cam;
+    const double dir_y = camera.right[1] * x_cam + camera.down[1] * y_cam + camera.look[1] * z_cam;
+    const double dir_z = camera.right[2] * x_cam + camera.down[2] * y_cam + camera.look[2] * z_cam;
+    if (std::abs(dir_y) < 1e-9)
+        return false;
+
+    // Intersect camera ray with world ground plane Y = 0.
+    const double t = -camera.cam_y / dir_y;
+    if (t <= 0.0)
+        return false;
+
+    x_mm = camera.cam_x + t * dir_x;
+    y_mm = 0.0;
+    z_mm = camera.cam_z + t * dir_z;
+    return std::isfinite(x_mm) && std::isfinite(z_mm);
+}
+
 bool loadCsv(const std::string& path, Records& records, std::string* error)
 {
     std::ifstream input(path);

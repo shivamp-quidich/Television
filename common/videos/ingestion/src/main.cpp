@@ -621,6 +621,7 @@ bool composeLiveBgrFromUyvy(std::vector<uint8_t>& host, int width, int height, i
                             const stype::OverlayOptions& overlay_options,
                             const GraphicOverlay* graphic,
                             const GraphicOverlayOptions* graphic_options,
+                            const stype::Record* graphic_pose,
                             bool write_uyvy_back)
 {
     if (width <= 0 || height <= 0 || pitch < width * 2)
@@ -634,7 +635,7 @@ bool composeLiveBgrFromUyvy(std::vector<uint8_t>& host, int width, int height, i
         stype::drawOverlay(bgr_scratch, *origin_record, overlay_options);
     if (graphic != nullptr && graphic_options != nullptr &&
         graphic_options->burn_into_sdi && graphic->placedCount() > 0)
-        graphic->burnIntoBgr(bgr_scratch, *graphic_options);
+        graphic->burnIntoBgr(bgr_scratch, *graphic_options, graphic_pose, &overlay_options);
     if (write_uyvy_back)
         cv::cvtColor(bgr_scratch, uyvy, cv::COLOR_BGR2YUV_UYVY);
     return true;
@@ -681,8 +682,21 @@ void handleGraphicPlacementOnVideo(GraphicOverlay& graphic,
                                    std::string& graphic_status,
                                    const ImVec2& image_min,
                                    const ImVec2& image_max,
-                                   const ImVec2& mouse)
+                                   const ImVec2& mouse,
+                                   int frame_width,
+                                   int frame_height,
+                                   const stype::Record* pose,
+                                   const stype::OverlayOptions* overlay_options)
 {
+    // Late-lock world plane once UDP/CSV pose is available after Apply.
+    if (options.align_state == GridAlignState::Applied && !graphic.worldPlaneValid() &&
+        pose != nullptr && overlay_options != nullptr && frame_width > 0 && frame_height > 0) {
+        if (graphic.tryLockWorldWithPose(frame_width, frame_height, *pose, *overlay_options,
+                                         options.live)) {
+            graphic_status = "World plane locked from UDP — graphics follow origin";
+        }
+    }
+
     if (graphic.hasPending() &&
         ImGui::IsItemHovered() && ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
         const float video_w = std::max(image_max.x - image_min.x, 1.0f);
@@ -690,14 +704,35 @@ void handleGraphicPlacementOnVideo(GraphicOverlay& graphic,
         const float u = std::clamp((mouse.x - image_min.x) / video_w, 0.0f, 1.0f);
         const float v = std::clamp((mouse.y - image_min.y) / video_h, 0.0f, 1.0f);
         const std::string placed_name = graphic.pendingName();
-        if (graphic.placeAt(u, v, options.width_fraction)) {
-            selected_graphic = -1;
+        bool placed = false;
+        const bool plane_ok = options.plane_grid &&
+            (options.align_state == GridAlignState::Aligning ||
+             options.align_state == GridAlignState::Applied);
+        if (plane_ok && frame_width > 0 && frame_height > 0) {
+            placed = graphic.placeAtPlane(u * frame_width, v * frame_height,
+                                          frame_width, frame_height, options);
+            if (placed) {
+                graphic_status = "Placed " + placed_name +
+                                 (graphic.worldPlaneValid()
+                                      ? " (world-anchored to UDP/origin)"
+                                      : " on alignment plane") +
+                                 "  (" + std::to_string(graphic.placedCount()) + " total)";
+            } else {
+                graphic_status = "Could not place — Align/Apply grid first";
+            }
+        } else if (!options.plane_grid &&
+                   graphic.placeAt(u, v, options.width_fraction)) {
+            placed = true;
             graphic_status = "Placed " + placed_name + "  (" +
-                             std::to_string(graphic.placedCount()) +
-                             " total) — select an image to place another";
+                             std::to_string(graphic.placedCount()) + " total)";
+        } else if (options.plane_grid) {
+            graphic_status = "Align grid, then Apply, then place graphic";
         }
+        if (placed)
+            selected_graphic = -1;
     }
-    graphic.drawPreview(ImGui::GetWindowDrawList(), image_min, image_max, mouse, options);
+    graphic.drawPreview(ImGui::GetWindowDrawList(), image_min, image_max, mouse, options,
+                        frame_width, frame_height, pose, overlay_options);
 }
 
 // Converts a BGR frame to pitched UYVY and sends it to DeckLink SDI, resizing
@@ -766,19 +801,54 @@ bool drawSignToggleRow(const char* label, int& sign)
     return changed;
 }
 
+// Offset nudge row: − / value / + using a fixed step, plus an editable field.
+bool drawOffsetNudgeRow(const char* label, double& value, double step, const char* unit)
+{
+    bool changed = false;
+    ImGui::PushID("offset");
+    ImGui::PushID(label);
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("%-4s", label);
+    ImGui::SameLine();
+    if (ImGui::Button("-")) {
+        value -= step;
+        changed = true;
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110.0f);
+    float edit = static_cast<float>(value);
+    if (ImGui::DragFloat("##v", &edit, static_cast<float>(step * 0.1), -1.0e6f, 1.0e6f, "%.1f")) {
+        value = static_cast<double>(edit);
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+")) {
+        value += step;
+        changed = true;
+    }
+    ImGui::SameLine();
+    ImGui::TextUnformatted(unit);
+    ImGui::PopID();
+    ImGui::PopID();
+    return changed;
+}
+
 // Draw a video texture centered both horizontally and vertically in the window.
 void drawCenteredVideo(GLuint texture, float video_w, float video_h,
                        GraphicOverlay& graphic,
                        GraphicOverlayOptions& options,
                        int& selected_graphic,
-                       std::string& graphic_status)
+                       std::string& graphic_status,
+                       int frame_width,
+                       int frame_height,
+                       const stype::Record* pose,
+                       const stype::OverlayOptions* overlay_options)
 {
     if (texture == 0 || video_w < 1.0f || video_h < 1.0f)
         return;
     const ImVec2 available = ImGui::GetContentRegionAvail();
     if (available.x < 1.0f || available.y < 1.0f)
         return;
-    // Whole-pixel size/padding avoids scrollbar flicker shifting the image.
     const float scale = std::min(available.x / video_w, available.y / video_h);
     const ImVec2 size(std::floor(video_w * scale), std::floor(video_h * scale));
     const float pad_x = std::floor(std::max(0.0f, (available.x - size.x) * 0.5f));
@@ -790,7 +860,8 @@ void drawCenteredVideo(GLuint texture, float video_w, float video_h,
     const ImVec2 image_max = ImGui::GetItemRectMax();
     const ImVec2 mouse = ImGui::GetIO().MousePos;
     handleGraphicPlacementOnVideo(graphic, options, selected_graphic, graphic_status,
-                                  image_min, image_max, mouse);
+                                  image_min, image_max, mouse,
+                                  frame_width, frame_height, pose, overlay_options);
 }
 } // namespace
 
@@ -1047,8 +1118,12 @@ int main(int argc, char* argv[])
                     now_ms - last_recording_sdi_ms >= interval_ms) {
                     last_recording_sdi_ms = now_ms;
                     recording_sdi_bgr = recording.display().clone();
-                    if (graphic_options.enabled && graphic_options.burn_into_sdi)
-                        graphic.burnIntoBgr(recording_sdi_bgr, graphic_options);
+                    if (graphic_options.enabled && graphic_options.burn_into_sdi) {
+                        const stype::Record* pose = recording.hasRecord()
+                            ? &recording.activeRecord() : nullptr;
+                        graphic.burnIntoBgr(recording_sdi_bgr, graphic_options,
+                                            pose, &recording.overlay_options);
+                    }
                     sendBgrToSdi(*ingest, recording_sdi_bgr, out_w, out_h,
                                  recording_resize_scratch, recording_uyvy_scratch,
                                  output_send_failing);
@@ -1119,7 +1194,7 @@ int main(int argc, char* argv[])
                     const bool composed = composeLiveBgrFromUyvy(
                         output_staging, frame_w, frame_h, frame_pitch, live_overlay_bgr,
                         &udp_record, recording.overlay_options,
-                        nullptr, nullptr, false);
+                        nullptr, nullptr, nullptr, false);
                     reportFailure(origin_compose_failing, !composed,
                                   "Live UDP origin compose failed");
                     if (composed && !live_overlay_bgr.empty()) {
@@ -1142,6 +1217,7 @@ int main(int argc, char* argv[])
                             sdi_origin ? &udp_record : nullptr, recording.overlay_options,
                             want_graphic_burn ? &graphic : nullptr,
                             want_graphic_burn ? &graphic_options : nullptr,
+                            want_graphic_burn && udp_delayed_valid ? &udp_record : nullptr,
                             true);
                     }
                     reportFailure(graphic_burn_failing, !composed,
@@ -1194,6 +1270,25 @@ int main(int argc, char* argv[])
         alignment_changed |= drawSignToggleRow("Y", align.sign_y);
         alignment_changed |= drawSignToggleRow("Z", align.sign_z);
 
+        ImGui::Separator();
+        ImGui::TextUnformatted("Position offset (move axes)");
+        ImGui::TextDisabled("Added after sign — nudges the world origin on video");
+        float pos_step = static_cast<float>(align.position_step_mm);
+        if (ImGui::SliderFloat("XYZ step (mm)", &pos_step, 1.0f, 500.0f, "%.0f"))
+            align.position_step_mm = static_cast<double>(pos_step);
+        alignment_changed |= drawOffsetNudgeRow("X", align.add_x_mm, align.position_step_mm, "mm");
+        alignment_changed |= drawOffsetNudgeRow("Y", align.add_y_mm, align.position_step_mm, "mm");
+        alignment_changed |= drawOffsetNudgeRow("Z", align.add_z_mm, align.position_step_mm, "mm");
+
+        ImGui::Separator();
+        ImGui::TextUnformatted("Angle offset");
+        float ang_step = static_cast<float>(align.angle_step_deg);
+        if (ImGui::SliderFloat("Angle step (deg)", &ang_step, 0.1f, 5.0f, "%.1f"))
+            align.angle_step_deg = static_cast<double>(ang_step);
+        alignment_changed |= drawOffsetNudgeRow("Pan", align.add_pan_deg, align.angle_step_deg, "deg");
+        alignment_changed |= drawOffsetNudgeRow("Tilt", align.add_tilt_deg, align.angle_step_deg, "deg");
+        alignment_changed |= drawOffsetNudgeRow("Roll", align.add_roll_deg, align.angle_step_deg, "deg");
+
         if (ImGui::Button("Reset alignment")) {
             align.reset();
             alignment_changed = true;
@@ -1213,12 +1308,12 @@ int main(int argc, char* argv[])
                         shown.tilt_deg, raw.tilt_deg, align.sign_tilt);
             ImGui::Text("Roll %+8.2f  (raw %+.2f x %+d)",
                         shown.roll_deg, raw.roll_deg, align.sign_roll);
-            ImGui::Text("X %+9.1f mm (raw %+.1f x %+d)",
-                        shown.x_mm, raw.x_mm, align.sign_x);
-            ImGui::Text("Y %+9.1f mm (raw %+.1f x %+d)",
-                        shown.y_mm, raw.y_mm, align.sign_y);
-            ImGui::Text("Z %+9.1f mm (raw %+.1f x %+d)",
-                        shown.z_mm, raw.z_mm, align.sign_z);
+            ImGui::Text("X %+9.1f mm (raw %+.1f x %+d + %.1f)",
+                        shown.x_mm, raw.x_mm, align.sign_x, align.add_x_mm);
+            ImGui::Text("Y %+9.1f mm (raw %+.1f x %+d + %.1f)",
+                        shown.y_mm, raw.y_mm, align.sign_y, align.add_y_mm);
+            ImGui::Text("Z %+9.1f mm (raw %+.1f x %+d + %.1f)",
+                        shown.z_mm, raw.z_mm, align.sign_z, align.add_z_mm);
         } else if (source_mode == SourceMode::Live && udp_delayed_valid) {
             const auto raw = recordFromCameraData(udp_delayed_camera);
             const auto shown = stype::applyAlignment(raw, align);
@@ -1230,12 +1325,12 @@ int main(int argc, char* argv[])
                         shown.tilt_deg, raw.tilt_deg, align.sign_tilt);
             ImGui::Text("Roll %+8.2f  (raw %+.2f x %+d)",
                         shown.roll_deg, raw.roll_deg, align.sign_roll);
-            ImGui::Text("X %+9.1f mm (raw %+.1f x %+d)",
-                        shown.x_mm, raw.x_mm, align.sign_x);
-            ImGui::Text("Y %+9.1f mm (raw %+.1f x %+d)",
-                        shown.y_mm, raw.y_mm, align.sign_y);
-            ImGui::Text("Z %+9.1f mm (raw %+.1f x %+d)",
-                        shown.z_mm, raw.z_mm, align.sign_z);
+            ImGui::Text("X %+9.1f mm (raw %+.1f x %+d + %.1f)",
+                        shown.x_mm, raw.x_mm, align.sign_x, align.add_x_mm);
+            ImGui::Text("Y %+9.1f mm (raw %+.1f x %+d + %.1f)",
+                        shown.y_mm, raw.y_mm, align.sign_y, align.add_y_mm);
+            ImGui::Text("Z %+9.1f mm (raw %+.1f x %+d + %.1f)",
+                        shown.z_mm, raw.z_mm, align.sign_z, align.add_z_mm);
         }
         ImGui::End();
 
@@ -1249,25 +1344,41 @@ int main(int argc, char* argv[])
 
         if (source_mode == SourceMode::Recording) {
             if (recording.isOpen() && !recording.display().empty()) {
+                const stype::Record* pose = recording.hasRecord()
+                    ? &recording.activeRecord() : nullptr;
                 drawCenteredVideo(recording_texture,
                                   static_cast<float>(recording.width()),
                                   static_cast<float>(recording.height()),
-                                  graphic, graphic_options, selected_graphic, graphic_status);
+                                  graphic, graphic_options, selected_graphic, graphic_status,
+                                  recording.width(), recording.height(),
+                                  pose, &recording.overlay_options);
             } else {
                 ImGui::TextUnformatted("Select a recording to play...");
             }
-        } else if (live_overlay_ready && live_overlay_texture != 0) {
-            drawCenteredVideo(live_overlay_texture,
-                              static_cast<float>(live_overlay_width),
-                              static_cast<float>(live_overlay_height),
-                              graphic, graphic_options, selected_graphic, graphic_status);
-        } else if (preview.rgbTexture()) {
-            drawCenteredVideo(preview.rgbTexture(),
-                              static_cast<float>(preview.width()),
-                              static_cast<float>(preview.height()),
-                              graphic, graphic_options, selected_graphic, graphic_status);
         } else {
-            ImGui::TextUnformatted("Waiting for GPU FrameData...");
+            stype::Record live_pose_storage;
+            const stype::Record* live_pose = nullptr;
+            if (udp_delayed_valid) {
+                live_pose_storage = recordFromCameraData(udp_delayed_camera);
+                live_pose = &live_pose_storage;
+            }
+            if (live_overlay_ready && live_overlay_texture != 0) {
+                drawCenteredVideo(live_overlay_texture,
+                                  static_cast<float>(live_overlay_width),
+                                  static_cast<float>(live_overlay_height),
+                                  graphic, graphic_options, selected_graphic, graphic_status,
+                                  live_overlay_width, live_overlay_height,
+                                  live_pose, &recording.overlay_options);
+            } else if (preview.rgbTexture()) {
+                drawCenteredVideo(preview.rgbTexture(),
+                                  static_cast<float>(preview.width()),
+                                  static_cast<float>(preview.height()),
+                                  graphic, graphic_options, selected_graphic, graphic_status,
+                                  preview.width(), preview.height(),
+                                  live_pose, &recording.overlay_options);
+            } else {
+                ImGui::TextUnformatted("Waiting for GPU FrameData...");
+            }
         }
         ImGui::End();
 
@@ -1563,11 +1674,97 @@ int main(int argc, char* argv[])
 
         ImGui::Separator();
         ImGui::TextUnformatted("Graphic overlay");
-        ImGui::TextUnformatted("Works on Live and Recording preview");
         ImGui::Checkbox("Show graphics", &graphic_options.enabled);
         ImGui::Checkbox("Burn into SDI", &graphic_options.burn_into_sdi);
-        ImGui::SliderFloat("Width fraction", &graphic_options.width_fraction, 0.05f, 1.0f, "%.2f");
-        ImGui::Text("Next size  %.0f%% of frame width", graphic_options.width_fraction * 100.0f);
+        ImGui::Checkbox("Plane grid placement", &graphic_options.plane_grid);
+
+        if (graphic_options.plane_grid) {
+            ImGui::TextUnformatted("1) Align grid  2) Apply (hides grid)  3) Place graphic");
+            const char* state_label = "Idle";
+            if (graphic_options.align_state == GridAlignState::Aligning)
+                state_label = "Aligning (grid visible)";
+            else if (graphic_options.align_state == GridAlignState::Applied)
+                state_label = graphic.worldPlaneValid()
+                    ? "Applied (grid hidden, world-locked)"
+                    : "Applied (grid hidden, waiting UDP)";
+            ImGui::TextDisabled("%s", state_label);
+
+            if (graphic_options.align_state != GridAlignState::Aligning) {
+                if (ImGui::Button("Align Grid")) {
+                    graphic.startAlignment(graphic_options);
+                    graphic_status = "Aligning — adjust sliders, then Apply";
+                }
+            } else {
+                if (ImGui::Button("Apply Grid")) {
+                    int fw = 1920, fh = 1080;
+                    const stype::Record* pose = nullptr;
+                    stype::Record pose_storage;
+                    if (source_mode == SourceMode::Recording && recording.hasRecord()) {
+                        fw = recording.width();
+                        fh = recording.height();
+                        pose_storage = recording.activeRecord();
+                        pose = &pose_storage;
+                    } else if (udp_delayed_valid) {
+                        if (live_overlay_ready) {
+                            fw = live_overlay_width;
+                            fh = live_overlay_height;
+                        } else if (preview.width() > 0) {
+                            fw = preview.width();
+                            fh = preview.height();
+                        }
+                        pose_storage = recordFromCameraData(udp_delayed_camera);
+                        pose = &pose_storage;
+                    }
+                    graphic.applyAlignment(graphic_options, fw, fh, pose,
+                                           &recording.overlay_options, graphic_status);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel Align")) {
+                    graphic.clearAlignment(graphic_options);
+                    graphic_status = "Alignment cancelled";
+                }
+            }
+            if (graphic_options.align_state == GridAlignState::Applied) {
+                ImGui::SameLine();
+                if (ImGui::Button("Edit Grid")) {
+                    graphic.startAlignment(graphic_options);
+                    graphic_status = "Editing grid — Apply again to lock / hide";
+                }
+            }
+
+            if (graphic_options.align_state == GridAlignState::Aligning) {
+                ImGui::Separator();
+                ImGui::TextUnformatted("Grid position");
+                ImGui::SliderFloat("Offset X", &graphic_options.grid.offset_x, -960.0f, 960.0f, "%.0f");
+                ImGui::SliderFloat("Offset Y", &graphic_options.grid.offset_y, -540.0f, 540.0f, "%.0f");
+                ImGui::SliderFloat("Depth", &graphic_options.grid.depth_z, 0.1f, 2.5f, "%.2f");
+                ImGui::SliderFloat("Rotate (Z)", &graphic_options.grid.rotation_deg, -180.0f, 180.0f, "%.1f");
+                ImGui::SliderFloat("Pitch (X)", &graphic_options.grid.pitch_deg, -89.0f, 89.0f, "%.1f");
+                ImGui::SliderFloat("Roll (Y)", &graphic_options.grid.roll_deg, -89.0f, 89.0f, "%.1f");
+                ImGui::SliderFloat("Grid width", &graphic_options.grid.grid_width, 100.0f, 3840.0f, "%.0f");
+                ImGui::SliderFloat("Grid height", &graphic_options.grid.grid_height, 75.0f, 2160.0f, "%.0f");
+                ImGui::SliderInt("Cols", &graphic_options.grid.grid_cols, 5, 80);
+                ImGui::SliderInt("Rows", &graphic_options.grid.grid_rows, 4, 60);
+                if (ImGui::Button("Reset grid"))
+                    graphic_options.grid.reset();
+            }
+
+            if (graphic_options.align_state == GridAlignState::Applied ||
+                graphic_options.align_state == GridAlignState::Aligning) {
+                ImGui::Separator();
+                ImGui::TextUnformatted("Graphic (live)");
+                ImGui::SliderFloat("Height (px)", &graphic_options.graphic_height_px, 20.0f, 800.0f, "%.0f");
+                ImGui::SliderFloat("Scale", &graphic_options.live.scale, 0.1f, 5.0f, "%.2fx");
+                ImGui::SliderFloat("Yaw (Z)", &graphic_options.live.yaw_deg, -180.0f, 180.0f, "%.1f");
+                ImGui::SliderFloat("Pitch", &graphic_options.live.pitch_deg, -180.0f, 180.0f, "%.1f");
+                ImGui::SliderFloat("Roll", &graphic_options.live.roll_deg, -180.0f, 180.0f, "%.1f");
+                if (ImGui::Button("Reset graphic transform"))
+                    graphic_options.live.reset();
+            }
+        } else {
+            ImGui::SliderFloat("Width fraction", &graphic_options.width_fraction, 0.05f, 1.0f, "%.2f");
+            ImGui::Text("Next size  %.0f%% of frame width", graphic_options.width_fraction * 100.0f);
+        }
         if (ImGui::Button("Refresh data/")) {
             graphic.refreshFileList(graphic_options.data_dir);
             graphic_status = std::to_string(graphic.files().size()) + " images in " +
@@ -1614,7 +1811,11 @@ int main(int argc, char* argv[])
         if (graphic.hasPending()) {
             ImGui::Text("Pending  %s  %dx%d", graphic.pendingName().c_str(),
                         graphic.pendingWidth(), graphic.pendingHeight());
-            ImGui::TextUnformatted("Yellow outline: next placement follows mouse");
+            ImGui::TextUnformatted(graphic_options.align_state == GridAlignState::Applied
+                                       ? "Click video to place on locked plane (follows UDP/origin)"
+                                       : graphic_options.align_state == GridAlignState::Aligning
+                                             ? "Align grid, then Apply before placing"
+                                             : "Yellow outline: next placement follows mouse");
             if (ImGui::Button("Cancel pending")) {
                 graphic.clearPending();
                 selected_graphic = -1;
@@ -1628,10 +1829,17 @@ int main(int argc, char* argv[])
             for (int i = 0; i < graphic.placedCount(); ++i) {
                 const auto& item = graphic.placed()[static_cast<std::size_t>(i)];
                 ImGui::PushID(i);
-                ImGui::Text("%d  %s  (%.2f, %.2f)  %.0f%%",
-                            i + 1, item.name.c_str(),
-                            item.center_u, item.center_v,
-                            item.width_fraction * 100.0f);
+                if (item.plane_space) {
+                    ImGui::Text("%d  %s  plane (%.0f, %.0f)%s",
+                                i + 1, item.name.c_str(),
+                                item.plane_cx, item.plane_cy,
+                                item.world_anchored ? "  [world]" : "");
+                } else {
+                    ImGui::Text("%d  %s  (%.2f, %.2f)  %.0f%%",
+                                i + 1, item.name.c_str(),
+                                item.center_u, item.center_v,
+                                item.width_fraction * 100.0f);
+                }
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Remove"))
                     remove_index = i;
