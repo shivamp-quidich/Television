@@ -546,6 +546,7 @@ int main(int argc, char* argv[])
 #include "ingest.hpp"
 #include "logger.h"
 #include "recording_playback.hpp"
+#include "stype_csv_overlay.hpp"
 #include "udp_receiver.hpp"
 #include "udp_sender.hpp"
 
@@ -589,23 +590,65 @@ bool copyFrameToHost(const FrameData& frame, std::vector<uint8_t>& host)
                         uyvy.pitch, uyvy.height, cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 
-// Converts the staged UYVY frame to BGR, burns all placed graphics, converts back.
-bool burnGraphicIntoStagedFrame(std::vector<uint8_t>& host, int width, int height, int pitch,
-                                const GraphicOverlay& graphic,
-                                const GraphicOverlayOptions& options,
-                                cv::Mat& bgr_scratch)
+stype::Record recordFromCameraData(const STypeState::CameraData& cam)
+{
+    stype::Record record;
+    record.stype_valid = cam.is_valid;
+    record.pan_deg = cam.pan_deg;
+    record.tilt_deg = cam.tilt_deg;
+    record.roll_deg = cam.roll_deg;
+    record.x_mm = cam.x_mm;
+    record.y_mm = cam.y_mm;
+    record.z_mm = cam.z_mm;
+    record.zoom_raw = cam.zoom_raw;
+    record.focus_raw = cam.focus_raw;
+    record.hfov_deg = cam.hfov_deg;
+    record.hf_ar = cam.hf_ar;
+    record.hf_k1 = cam.hf_k1;
+    record.hf_k2 = cam.hf_k2;
+    record.hf_cx_mm = cam.hf_cx_mm;
+    record.hf_cy_mm = cam.hf_cy_mm;
+    record.hf_pa_width_mm = cam.hf_pa_width_mm;
+    return record;
+}
+
+// UYVY host → BGR with optional world-origin gizmo (same as recording) and
+// optional graphic burn-in. When write_uyvy_back is true, writes BGR back into
+// the pitched UYVY buffer for SDI.
+bool composeLiveBgrFromUyvy(std::vector<uint8_t>& host, int width, int height, int pitch,
+                            cv::Mat& bgr_scratch,
+                            const stype::Record* origin_record,
+                            const stype::OverlayOptions& overlay_options,
+                            const GraphicOverlay* graphic,
+                            const GraphicOverlayOptions* graphic_options,
+                            bool write_uyvy_back)
 {
     if (width <= 0 || height <= 0 || pitch < width * 2)
         return false;
     if (host.size() < static_cast<std::size_t>(pitch) * static_cast<std::size_t>(height))
         return false;
-    if (!options.burn_into_sdi || graphic.placedCount() == 0)
-        return true;
 
     cv::Mat uyvy(height, width, CV_8UC2, host.data(), static_cast<std::size_t>(pitch));
     cv::cvtColor(uyvy, bgr_scratch, cv::COLOR_YUV2BGR_UYVY);
-    graphic.burnIntoBgr(bgr_scratch, options);
-    cv::cvtColor(bgr_scratch, uyvy, cv::COLOR_BGR2YUV_UYVY);
+    if (origin_record != nullptr)
+        stype::drawOverlay(bgr_scratch, *origin_record, overlay_options);
+    if (graphic != nullptr && graphic_options != nullptr &&
+        graphic_options->burn_into_sdi && graphic->placedCount() > 0)
+        graphic->burnIntoBgr(bgr_scratch, *graphic_options);
+    if (write_uyvy_back)
+        cv::cvtColor(bgr_scratch, uyvy, cv::COLOR_BGR2YUV_UYVY);
+    return true;
+}
+
+bool writeBgrIntoUyvy(std::vector<uint8_t>& host, int width, int height, int pitch,
+                      const cv::Mat& bgr)
+{
+    if (bgr.empty() || bgr.cols != width || bgr.rows != height)
+        return false;
+    if (host.size() < static_cast<std::size_t>(pitch) * static_cast<std::size_t>(height))
+        return false;
+    cv::Mat uyvy(height, width, CV_8UC2, host.data(), static_cast<std::size_t>(pitch));
+    cv::cvtColor(bgr, uyvy, cv::COLOR_BGR2YUV_UYVY);
     return true;
 }
 
@@ -733,10 +776,13 @@ void drawCenteredVideo(GLuint texture, float video_w, float video_h,
     if (texture == 0 || video_w < 1.0f || video_h < 1.0f)
         return;
     const ImVec2 available = ImGui::GetContentRegionAvail();
+    if (available.x < 1.0f || available.y < 1.0f)
+        return;
+    // Whole-pixel size/padding avoids scrollbar flicker shifting the image.
     const float scale = std::min(available.x / video_w, available.y / video_h);
-    const ImVec2 size(video_w * scale, video_h * scale);
-    const float pad_x = std::max(0.0f, (available.x - size.x) * 0.5f);
-    const float pad_y = std::max(0.0f, (available.y - size.y) * 0.5f);
+    const ImVec2 size(std::floor(video_w * scale), std::floor(video_h * scale));
+    const float pad_x = std::floor(std::max(0.0f, (available.x - size.x) * 0.5f));
+    const float pad_y = std::floor(std::max(0.0f, (available.y - size.y) * 0.5f));
     ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + pad_x,
                                ImGui::GetCursorPosY() + pad_y));
     ImGui::Image(reinterpret_cast<void*>(static_cast<intptr_t>(texture)), size);
@@ -923,6 +969,23 @@ int main(int argc, char* argv[])
     std::int64_t last_recording_sdi_ms = 0;
     bool recording_sdi_enabled = true;
 
+    // Live DeckLink preview with the same world-origin gizmo as recording,
+    // driven by delayed UDP Stype HF pose instead of CSV.
+    GLuint live_overlay_texture = 0;
+    glGenTextures(1, &live_overlay_texture);
+    glBindTexture(GL_TEXTURE_2D, live_overlay_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    cv::Mat live_overlay_bgr;
+    bool live_overlay_ready = false;
+    int live_overlay_width = 0;
+    int live_overlay_height = 0;
+    bool live_burn_origin_into_sdi = true;
+    bool origin_compose_failing = false;
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
@@ -1019,8 +1082,11 @@ int main(int argc, char* argv[])
                 video_config.fps_threshold = info.fps_threshold;
                 shared_state.setData(video_config);
 
-                const bool dimensions_match_mode = info.width == frame->uyvy_frame->width &&
-                                                   info.height == frame->uyvy_frame->height;
+                const int frame_w = frame->uyvy_frame->width;
+                const int frame_h = frame->uyvy_frame->height;
+                const int frame_pitch = frame->uyvy_frame->pitch;
+                const bool dimensions_match_mode =
+                    info.width == frame_w && info.height == frame_h;
                 if (dimensions_match_mode) {
                     stable_frame_count = (stable_width == info.width && stable_height == info.height)
                         ? stable_frame_count + 1 : 1;
@@ -1031,25 +1097,67 @@ int main(int argc, char* argv[])
                 }
                 if (!output_ready && stable_frame_count >= 2)
                     output_ready = ingest->initializeOutput(output_device);
-                if (output_ready && dimensions_match_mode && preview_updated) {
-                    const bool staged = copyFrameToHost(*frame, output_staging);
+
+                const bool want_origin = recording.show_world_origin && udp_delayed_valid;
+                const bool want_graphic_burn = graphic_options.enabled &&
+                    graphic_options.burn_into_sdi && graphic.placedCount() > 0;
+                const bool want_sdi = output_ready && dimensions_match_mode && preview_updated;
+                const bool sdi_origin = want_origin && live_burn_origin_into_sdi;
+
+                bool staged = false;
+                if (want_origin || want_sdi) {
+                    staged = copyFrameToHost(*frame, output_staging);
                     reportFailure(staging_failing, !staged, "Device-to-host staging copy failed");
-                    if (staged) {
-                        const bool burned = burnGraphicIntoStagedFrame(
-                            output_staging, frame->uyvy_frame->width, frame->uyvy_frame->height,
-                            frame->uyvy_frame->pitch, graphic, graphic_options, graphic_scratch);
-                        reportFailure(graphic_burn_failing, !burned,
-                                      "Graphic burn-in failed; sending the clean frame");
-                        const bool sent = ingest->sendFrameToOutput(
-                            output_staging.data(), output_staging.size(),
-                            frame->uyvy_frame->width, frame->uyvy_frame->height,
-                            frame->uyvy_frame->pitch);
-                        reportFailure(output_send_failing, !sent, "DeckLink output rejected a frame");
+                }
+
+                if (!want_origin)
+                    live_overlay_ready = false;
+
+                if (staged && want_origin) {
+                    // Preview: origin only (graphics stay as ImGui overlays).
+                    const stype::Record udp_record = recordFromCameraData(udp_delayed_camera);
+                    const bool composed = composeLiveBgrFromUyvy(
+                        output_staging, frame_w, frame_h, frame_pitch, live_overlay_bgr,
+                        &udp_record, recording.overlay_options,
+                        nullptr, nullptr, false);
+                    reportFailure(origin_compose_failing, !composed,
+                                  "Live UDP origin compose failed");
+                    if (composed && !live_overlay_bgr.empty()) {
+                        uploadBgrTexture(live_overlay_texture, live_overlay_bgr);
+                        live_overlay_ready = true;
+                        live_overlay_width = live_overlay_bgr.cols;
+                        live_overlay_height = live_overlay_bgr.rows;
                     }
+                }
+
+                if (staged && want_sdi && (sdi_origin || want_graphic_burn)) {
+                    bool composed = false;
+                    if (sdi_origin && !want_graphic_burn && live_overlay_ready) {
+                        composed = writeBgrIntoUyvy(output_staging, frame_w, frame_h,
+                                                    frame_pitch, live_overlay_bgr);
+                    } else {
+                        const stype::Record udp_record = recordFromCameraData(udp_delayed_camera);
+                        composed = composeLiveBgrFromUyvy(
+                            output_staging, frame_w, frame_h, frame_pitch, graphic_scratch,
+                            sdi_origin ? &udp_record : nullptr, recording.overlay_options,
+                            want_graphic_burn ? &graphic : nullptr,
+                            want_graphic_burn ? &graphic_options : nullptr,
+                            true);
+                    }
+                    reportFailure(graphic_burn_failing, !composed,
+                                  "SDI compose failed; sending the clean frame");
+                }
+
+                if (want_sdi && staged) {
+                    const bool sent = ingest->sendFrameToOutput(
+                        output_staging.data(), output_staging.size(),
+                        frame_w, frame_h, frame_pitch);
+                    reportFailure(output_send_failing, !sent, "DeckLink output rejected a frame");
                 }
                 reportFailure(preview_failing, !preview_updated,
                               "GPU preview update failed; SDI output is gated on it");
                 status = info.display_mode_name + "  GPU FrameData #" + std::to_string(frame->id) +
+                         (want_origin && live_overlay_ready ? "  + UDP origin" : "") +
                          (preview_updated ? "" : "  (preview update failed)");
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1069,7 +1177,8 @@ int main(int argc, char* argv[])
         ImGui::SetNextWindowPos(viewport->WorkPos);
         ImGui::SetNextWindowSize(ImVec2(align_width, viewport->WorkSize.y));
         ImGui::Begin("Apply Alignment", nullptr,
-                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysVerticalScrollbar);
         ImGui::TextWrapped(
             "Manipulate tracking over every frame so the world origin sits correctly.");
         ImGui::Separator();
@@ -1093,11 +1202,28 @@ int main(int argc, char* argv[])
             recording.refreshOverlay();
             recording_display_dirty = true;
         }
-        if (recording.hasRecord()) {
+        if (source_mode == SourceMode::Recording && recording.hasRecord()) {
             const auto& raw = recording.activeRecord();
             const auto shown = stype::applyAlignment(raw, align);
             ImGui::Separator();
             ImGui::TextUnformatted("Aligned pose (this frame)");
+            ImGui::Text("Pan  %+8.2f  (raw %+.2f x %+d)",
+                        shown.pan_deg, raw.pan_deg, align.sign_pan);
+            ImGui::Text("Tilt %+8.2f  (raw %+.2f x %+d)",
+                        shown.tilt_deg, raw.tilt_deg, align.sign_tilt);
+            ImGui::Text("Roll %+8.2f  (raw %+.2f x %+d)",
+                        shown.roll_deg, raw.roll_deg, align.sign_roll);
+            ImGui::Text("X %+9.1f mm (raw %+.1f x %+d)",
+                        shown.x_mm, raw.x_mm, align.sign_x);
+            ImGui::Text("Y %+9.1f mm (raw %+.1f x %+d)",
+                        shown.y_mm, raw.y_mm, align.sign_y);
+            ImGui::Text("Z %+9.1f mm (raw %+.1f x %+d)",
+                        shown.z_mm, raw.z_mm, align.sign_z);
+        } else if (source_mode == SourceMode::Live && udp_delayed_valid) {
+            const auto raw = recordFromCameraData(udp_delayed_camera);
+            const auto shown = stype::applyAlignment(raw, align);
+            ImGui::Separator();
+            ImGui::TextUnformatted("Aligned UDP pose (delayed)");
             ImGui::Text("Pan  %+8.2f  (raw %+.2f x %+d)",
                         shown.pan_deg, raw.pan_deg, align.sign_pan);
             ImGui::Text("Tilt %+8.2f  (raw %+.2f x %+d)",
@@ -1116,7 +1242,10 @@ int main(int argc, char* argv[])
         // Center: video preview (horizontally between panels, vertically centered).
         ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + align_width, viewport->WorkPos.y));
         ImGui::SetNextWindowSize(ImVec2(center_width, viewport->WorkSize.y));
-        ImGui::Begin("Video Preview", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+        ImGui::Begin("Video Preview", nullptr,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoScrollWithMouse);
 
         if (source_mode == SourceMode::Recording) {
             if (recording.isOpen() && !recording.display().empty()) {
@@ -1127,6 +1256,11 @@ int main(int argc, char* argv[])
             } else {
                 ImGui::TextUnformatted("Select a recording to play...");
             }
+        } else if (live_overlay_ready && live_overlay_texture != 0) {
+            drawCenteredVideo(live_overlay_texture,
+                              static_cast<float>(live_overlay_width),
+                              static_cast<float>(live_overlay_height),
+                              graphic, graphic_options, selected_graphic, graphic_status);
         } else if (preview.rgbTexture()) {
             drawCenteredVideo(preview.rgbTexture(),
                               static_cast<float>(preview.width()),
@@ -1139,7 +1273,9 @@ int main(int argc, char* argv[])
 
         ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + align_width + center_width, viewport->WorkPos.y));
         ImGui::SetNextWindowSize(ImVec2(controls_width, viewport->WorkSize.y));
-        ImGui::Begin("Application Status", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+        ImGui::Begin("Application Status", nullptr,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysVerticalScrollbar);
         ImGui::TextWrapped("%s", status.c_str());
         ImGui::TextWrapped("%s", config_status.c_str());
         ImGui::Text("DeckLink in %d  out %d", input_device, output_device);
@@ -1149,18 +1285,47 @@ int main(int argc, char* argv[])
         int source_i = static_cast<int>(source_mode);
         if (ImGui::RadioButton("Live DeckLink", &source_i, 0)) {
             source_mode = SourceMode::Live;
+            // Fully stop Recording so it cannot keep driving SDI / UDP / tick.
             recording.playing = false;
             recording_udp_send_enabled = false;
+            recording_sdi_enabled = false;
+            recording_display_dirty = false;
+            if (recording.isOpen()) {
+                recording.close();
+                selected_recording = -1;
+                recording_status = std::to_string(recording_pairs.size()) +
+                                   " videos (.mp4/.mkv/…) with CSV in " +
+                                   app_config.recordings_dir;
+            }
             status = "Live DeckLink";
         }
         ImGui::SameLine();
         if (ImGui::RadioButton("Recording", &source_i, 1)) {
             source_mode = SourceMode::Recording;
             recording_udp_send_enabled = true;
+            recording_sdi_enabled = true;
             status = "Recording playback";
         }
         source_mode = static_cast<SourceMode>(source_i);
 
+        if (source_mode == SourceMode::Live) {
+            ImGui::Separator();
+            ImGui::TextUnformatted("Live UDP world origin");
+            ImGui::TextDisabled("Same gizmo as recording, from delayed Stype HF UDP");
+            ImGui::Checkbox("Show world origin", &recording.show_world_origin);
+            ImGui::Checkbox("Burn origin into SDI", &live_burn_origin_into_sdi);
+            float gizmo_mm = static_cast<float>(recording.overlay_options.gizmo_length_mm);
+            if (ImGui::SliderFloat("Gizmo length (mm)", &gizmo_mm, 50.0f, 5000.0f, "%.0f"))
+                recording.overlay_options.gizmo_length_mm = gizmo_mm;
+            ImGui::Checkbox("Apply HF distortion (k1/k2)",
+                            &recording.overlay_options.apply_distortion);
+            if (!udp_delayed_valid)
+                ImGui::TextWrapped("Waiting for delayed UDP pose...");
+            else if (live_overlay_ready)
+                ImGui::TextUnformatted("Origin drawn on Live preview + SDI");
+        }
+
+        if (source_mode == SourceMode::Recording) {
         ImGui::Separator();
         ImGui::TextUnformatted("Recording playback");
         ImGui::TextWrapped("%s", recording_status.c_str());
@@ -1216,8 +1381,7 @@ int main(int argc, char* argv[])
 
         if (recording.isOpen()) {
             ImGui::Checkbox("SDI out", &recording_sdi_enabled);
-            if (source_mode == SourceMode::Recording)
-                ImGui::Checkbox("UDP send CSV while playing", &recording_udp_send_enabled);
+            ImGui::Checkbox("UDP send CSV while playing", &recording_udp_send_enabled);
             if (ImGui::Button(recording.playing ? "Pause" : "Play"))
                 recording.playing = !recording.playing;
             ImGui::SameLine();
@@ -1273,6 +1437,7 @@ int main(int argc, char* argv[])
                             static_cast<long long>(r.focus_raw));
             }
         }
+        } // Recording playback UI (hidden while Live)
 
         if (ImGui::Button("Save config")) {
             const std::string save_path = app_config.path.empty() ? config_path : app_config.path;
@@ -1307,7 +1472,7 @@ int main(int argc, char* argv[])
             if (udp_send_port < 1) udp_send_port = 1;
             if (udp_send_port > 65535) udp_send_port = 65535;
         }
-        if (ImGui::SliderInt("Recv delay (ms)", &udp_recv_delay_ms, 0, 2000)) {
+        if (ImGui::SliderInt("Recv delay (ms)", &udp_recv_delay_ms, 0, 100)) {
             // Keep buffered packets; only the release threshold changes.
         }
         ImGui::TextDisabled("Hold each UDP packet this many ms before use/plots");
@@ -1499,6 +1664,8 @@ int main(int argc, char* argv[])
     recording.close();
     if (recording_texture != 0)
         glDeleteTextures(1, &recording_texture);
+    if (live_overlay_texture != 0)
+        glDeleteTextures(1, &live_overlay_texture);
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

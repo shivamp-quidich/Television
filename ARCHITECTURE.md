@@ -5,7 +5,8 @@
 Televison receives live UYVY 4:2:2 video from a Blackmagic DeckLink input,
 uploads it into a GPU-owned `FrameData::uyvy_frame`, previews it through
 CUDA–OpenGL interop, and sends UYVY frames to a DeckLink output. Stype HF
-tracking packets can be received over UDP and are shown in the status panel.
+tracking packets received over UDP drive the same world-origin XYZ gizmo on
+the Live preview and optional SDI burn-in as recording playback uses from CSV.
 Still images
 from `data/` can be selected and placed on the video with the mouse; multiple
 placements are supported and are optionally burned into the SDI output. A
@@ -90,6 +91,9 @@ flowchart TB
         send -->|"localhost Stype HF"| bind
     end
     pose --> statuspanel
+    pose -->|"CameraData → stype::Record"| liveGizmo["drawOverlay on Live BGR → preview + optional SDI"]
+    liveGizmo --> statuspanel
+    liveGizmo --> sdi_out
 
     subgraph recording["Recording playback"]
         pairs["List video + *_stype.csv in recordings_dir"]
@@ -278,6 +282,15 @@ Recording playback (stype_player-style):
 - **Apply Alignment** dials pan/tilt/roll and X/Y/Z for the world-origin gizmo:
   each axis has a **+** button that multiplies that sign by -1 (+1 ↔ -1);
 - **Source** radio switches between **Live DeckLink** and **Recording**;
+  switching to Live stops playback, disables recording SDI/UDP send, closes the
+  open recording, and hides the Recording playback controls so only Live owns
+  preview/SDI; switching back to Recording re-enables those controls;
+- **Live UDP world origin**: with delayed Stype HF UDP available, Live converts
+  each ingested UYVY frame to BGR and calls the same `stype::drawOverlay` used
+  by recording (`stype_csv_overlay.cpp`), using Apply Alignment signs and the
+  shared gizmo / distortion options; the composed BGR is shown in the center
+  preview (instead of the plain GPU UYVY decode) and can optionally be burned
+  into SDI (**Burn origin into SDI**);
 - **Refresh recordings** scans `[recording] recordings_dir` (editable in the
   panel) for `.mp4` / `.mkv` / `.mov` / `.avi` files that have a matching
   `{stem}_stype.csv` sidecar (default `/home/quidich/stype_handover/recordings`);
